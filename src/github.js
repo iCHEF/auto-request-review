@@ -76,15 +76,27 @@ async function fetch_changed_files() {
   return changed_files;
 }
 
+/** @param {string[]} reviewers */
 async function assign_reviewers(reviewers) {
   const context = get_context();
   const octokit = get_octokit();
+
+  const userReviewers = reviewers.filter(reviewerName => !reviewerName.includes('/'));
+  const teamReviewers = reviewers
+    .filter(reviewerName => reviewerName.includes('/'))
+    // Replace 'iCHEF/frontend' to just 'frontend'
+    .map(teamSlugWithOrg => teamSlugWithOrg.replace(/^.*\//, ''));
+
+    if (teamReviewers.length) {
+      core.info(`teams detected: ${teamReviewers.join(', ')}`);
+    }
 
   return octokit.pulls.requestReviewers({
     owner: context.repo.owner,
     repo: context.repo.repo,
     pull_number: context.payload.pull_request.number,
-    reviewers,
+    reviewers: userReviewers,
+    team_reviewers: teamReviewers,
   });
 }
 
