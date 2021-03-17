@@ -1915,11 +1915,17 @@ class ParseContext {
 
     while (ch === PlainValue.Char.ANCHOR || ch === PlainValue.Char.COMMENT || ch === PlainValue.Char.TAG || ch === '\n') {
       if (ch === '\n') {
-        const lineStart = offset + 1;
-        const inEnd = PlainValue.Node.endOfIndent(src, lineStart);
+        let inEnd = offset;
+        let lineStart;
+
+        do {
+          lineStart = inEnd + 1;
+          inEnd = PlainValue.Node.endOfIndent(src, lineStart);
+        } while (src[inEnd] === '\n');
+
         const indentDiff = inEnd - (lineStart + this.indent);
         const noIndicatorAsIndent = parent.type === PlainValue.Type.SEQ_ITEM && parent.context.atLineStart;
-        if (!PlainValue.Node.nextNodeIsIndented(src[inEnd], indentDiff, !noIndicatorAsIndent)) break;
+        if (src[inEnd] !== '#' && !PlainValue.Node.nextNodeIsIndented(src[inEnd], indentDiff, !noIndicatorAsIndent)) break;
         this.atLineStart = true;
         this.lineStart = lineStart;
         lineHasProps = false;
@@ -3517,771 +3523,6 @@ module.exports = isSymbol;
 
 /***/ }),
 
-/***/ 192:
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-
-var PlainValue = __webpack_require__(513);
-var resolveSeq = __webpack_require__(310);
-var Schema = __webpack_require__(525);
-
-const defaultOptions = {
-  anchorPrefix: 'a',
-  customTags: null,
-  indent: 2,
-  indentSeq: true,
-  keepCstNodes: false,
-  keepNodeTypes: true,
-  keepBlobsInJSON: true,
-  mapAsMap: false,
-  maxAliasCount: 100,
-  prettyErrors: false,
-  // TODO Set true in v2
-  simpleKeys: false,
-  version: '1.2'
-};
-const scalarOptions = {
-  get binary() {
-    return resolveSeq.binaryOptions;
-  },
-
-  set binary(opt) {
-    Object.assign(resolveSeq.binaryOptions, opt);
-  },
-
-  get bool() {
-    return resolveSeq.boolOptions;
-  },
-
-  set bool(opt) {
-    Object.assign(resolveSeq.boolOptions, opt);
-  },
-
-  get int() {
-    return resolveSeq.intOptions;
-  },
-
-  set int(opt) {
-    Object.assign(resolveSeq.intOptions, opt);
-  },
-
-  get null() {
-    return resolveSeq.nullOptions;
-  },
-
-  set null(opt) {
-    Object.assign(resolveSeq.nullOptions, opt);
-  },
-
-  get str() {
-    return resolveSeq.strOptions;
-  },
-
-  set str(opt) {
-    Object.assign(resolveSeq.strOptions, opt);
-  }
-
-};
-const documentOptions = {
-  '1.0': {
-    schema: 'yaml-1.1',
-    merge: true,
-    tagPrefixes: [{
-      handle: '!',
-      prefix: PlainValue.defaultTagPrefix
-    }, {
-      handle: '!!',
-      prefix: 'tag:private.yaml.org,2002:'
-    }]
-  },
-  '1.1': {
-    schema: 'yaml-1.1',
-    merge: true,
-    tagPrefixes: [{
-      handle: '!',
-      prefix: '!'
-    }, {
-      handle: '!!',
-      prefix: PlainValue.defaultTagPrefix
-    }]
-  },
-  '1.2': {
-    schema: 'core',
-    merge: false,
-    tagPrefixes: [{
-      handle: '!',
-      prefix: '!'
-    }, {
-      handle: '!!',
-      prefix: PlainValue.defaultTagPrefix
-    }]
-  }
-};
-
-function stringifyTag(doc, tag) {
-  if ((doc.version || doc.options.version) === '1.0') {
-    const priv = tag.match(/^tag:private\.yaml\.org,2002:([^:/]+)$/);
-    if (priv) return '!' + priv[1];
-    const vocab = tag.match(/^tag:([a-zA-Z0-9-]+)\.yaml\.org,2002:(.*)/);
-    return vocab ? `!${vocab[1]}/${vocab[2]}` : `!${tag.replace(/^tag:/, '')}`;
-  }
-
-  let p = doc.tagPrefixes.find(p => tag.indexOf(p.prefix) === 0);
-
-  if (!p) {
-    const dtp = doc.getDefaults().tagPrefixes;
-    p = dtp && dtp.find(p => tag.indexOf(p.prefix) === 0);
-  }
-
-  if (!p) return tag[0] === '!' ? tag : `!<${tag}>`;
-  const suffix = tag.substr(p.prefix.length).replace(/[!,[\]{}]/g, ch => ({
-    '!': '%21',
-    ',': '%2C',
-    '[': '%5B',
-    ']': '%5D',
-    '{': '%7B',
-    '}': '%7D'
-  })[ch]);
-  return p.handle + suffix;
-}
-
-function getTagObject(tags, item) {
-  if (item instanceof resolveSeq.Alias) return resolveSeq.Alias;
-
-  if (item.tag) {
-    const match = tags.filter(t => t.tag === item.tag);
-    if (match.length > 0) return match.find(t => t.format === item.format) || match[0];
-  }
-
-  let tagObj, obj;
-
-  if (item instanceof resolveSeq.Scalar) {
-    obj = item.value; // TODO: deprecate/remove class check
-
-    const match = tags.filter(t => t.identify && t.identify(obj) || t.class && obj instanceof t.class);
-    tagObj = match.find(t => t.format === item.format) || match.find(t => !t.format);
-  } else {
-    obj = item;
-    tagObj = tags.find(t => t.nodeClass && obj instanceof t.nodeClass);
-  }
-
-  if (!tagObj) {
-    const name = obj && obj.constructor ? obj.constructor.name : typeof obj;
-    throw new Error(`Tag not resolved for ${name} value`);
-  }
-
-  return tagObj;
-} // needs to be called before value stringifier to allow for circular anchor refs
-
-
-function stringifyProps(node, tagObj, {
-  anchors,
-  doc
-}) {
-  const props = [];
-  const anchor = doc.anchors.getName(node);
-
-  if (anchor) {
-    anchors[anchor] = node;
-    props.push(`&${anchor}`);
-  }
-
-  if (node.tag) {
-    props.push(stringifyTag(doc, node.tag));
-  } else if (!tagObj.default) {
-    props.push(stringifyTag(doc, tagObj.tag));
-  }
-
-  return props.join(' ');
-}
-
-function stringify(item, ctx, onComment, onChompKeep) {
-  const {
-    anchors,
-    schema
-  } = ctx.doc;
-  let tagObj;
-
-  if (!(item instanceof resolveSeq.Node)) {
-    const createCtx = {
-      aliasNodes: [],
-      onTagObj: o => tagObj = o,
-      prevObjects: new Map()
-    };
-    item = schema.createNode(item, true, null, createCtx);
-
-    for (const alias of createCtx.aliasNodes) {
-      alias.source = alias.source.node;
-      let name = anchors.getName(alias.source);
-
-      if (!name) {
-        name = anchors.newName();
-        anchors.map[name] = alias.source;
-      }
-    }
-  }
-
-  if (item instanceof resolveSeq.Pair) return item.toString(ctx, onComment, onChompKeep);
-  if (!tagObj) tagObj = getTagObject(schema.tags, item);
-  const props = stringifyProps(item, tagObj, ctx);
-  if (props.length > 0) ctx.indentAtStart = (ctx.indentAtStart || 0) + props.length + 1;
-  const str = typeof tagObj.stringify === 'function' ? tagObj.stringify(item, ctx, onComment, onChompKeep) : item instanceof resolveSeq.Scalar ? resolveSeq.stringifyString(item, ctx, onComment, onChompKeep) : item.toString(ctx, onComment, onChompKeep);
-  if (!props) return str;
-  return item instanceof resolveSeq.Scalar || str[0] === '{' || str[0] === '[' ? `${props} ${str}` : `${props}\n${ctx.indent}${str}`;
-}
-
-class Anchors {
-  static validAnchorNode(node) {
-    return node instanceof resolveSeq.Scalar || node instanceof resolveSeq.YAMLSeq || node instanceof resolveSeq.YAMLMap;
-  }
-
-  constructor(prefix) {
-    PlainValue._defineProperty(this, "map", {});
-
-    this.prefix = prefix;
-  }
-
-  createAlias(node, name) {
-    this.setAnchor(node, name);
-    return new resolveSeq.Alias(node);
-  }
-
-  createMergePair(...sources) {
-    const merge = new resolveSeq.Merge();
-    merge.value.items = sources.map(s => {
-      if (s instanceof resolveSeq.Alias) {
-        if (s.source instanceof resolveSeq.YAMLMap) return s;
-      } else if (s instanceof resolveSeq.YAMLMap) {
-        return this.createAlias(s);
-      }
-
-      throw new Error('Merge sources must be Map nodes or their Aliases');
-    });
-    return merge;
-  }
-
-  getName(node) {
-    const {
-      map
-    } = this;
-    return Object.keys(map).find(a => map[a] === node);
-  }
-
-  getNames() {
-    return Object.keys(this.map);
-  }
-
-  getNode(name) {
-    return this.map[name];
-  }
-
-  newName(prefix) {
-    if (!prefix) prefix = this.prefix;
-    const names = Object.keys(this.map);
-
-    for (let i = 1; true; ++i) {
-      const name = `${prefix}${i}`;
-      if (!names.includes(name)) return name;
-    }
-  } // During parsing, map & aliases contain CST nodes
-
-
-  resolveNodes() {
-    const {
-      map,
-      _cstAliases
-    } = this;
-    Object.keys(map).forEach(a => {
-      map[a] = map[a].resolved;
-    });
-
-    _cstAliases.forEach(a => {
-      a.source = a.source.resolved;
-    });
-
-    delete this._cstAliases;
-  }
-
-  setAnchor(node, name) {
-    if (node != null && !Anchors.validAnchorNode(node)) {
-      throw new Error('Anchors may only be set for Scalar, Seq and Map nodes');
-    }
-
-    if (name && /[\x00-\x19\s,[\]{}]/.test(name)) {
-      throw new Error('Anchor names must not contain whitespace or control characters');
-    }
-
-    const {
-      map
-    } = this;
-    const prev = node && Object.keys(map).find(a => map[a] === node);
-
-    if (prev) {
-      if (!name) {
-        return prev;
-      } else if (prev !== name) {
-        delete map[prev];
-        map[name] = node;
-      }
-    } else {
-      if (!name) {
-        if (!node) return null;
-        name = this.newName();
-      }
-
-      map[name] = node;
-    }
-
-    return name;
-  }
-
-}
-
-const visit = (node, tags) => {
-  if (node && typeof node === 'object') {
-    const {
-      tag
-    } = node;
-
-    if (node instanceof resolveSeq.Collection) {
-      if (tag) tags[tag] = true;
-      node.items.forEach(n => visit(n, tags));
-    } else if (node instanceof resolveSeq.Pair) {
-      visit(node.key, tags);
-      visit(node.value, tags);
-    } else if (node instanceof resolveSeq.Scalar) {
-      if (tag) tags[tag] = true;
-    }
-  }
-
-  return tags;
-};
-
-const listTagNames = node => Object.keys(visit(node, {}));
-
-function parseContents(doc, contents) {
-  const comments = {
-    before: [],
-    after: []
-  };
-  let body = undefined;
-  let spaceBefore = false;
-
-  for (const node of contents) {
-    if (node.valueRange) {
-      if (body !== undefined) {
-        const msg = 'Document contains trailing content not separated by a ... or --- line';
-        doc.errors.push(new PlainValue.YAMLSyntaxError(node, msg));
-        break;
-      }
-
-      const res = resolveSeq.resolveNode(doc, node);
-
-      if (spaceBefore) {
-        res.spaceBefore = true;
-        spaceBefore = false;
-      }
-
-      body = res;
-    } else if (node.comment !== null) {
-      const cc = body === undefined ? comments.before : comments.after;
-      cc.push(node.comment);
-    } else if (node.type === PlainValue.Type.BLANK_LINE) {
-      spaceBefore = true;
-
-      if (body === undefined && comments.before.length > 0 && !doc.commentBefore) {
-        // space-separated comments at start are parsed as document comments
-        doc.commentBefore = comments.before.join('\n');
-        comments.before = [];
-      }
-    }
-  }
-
-  doc.contents = body || null;
-
-  if (!body) {
-    doc.comment = comments.before.concat(comments.after).join('\n') || null;
-  } else {
-    const cb = comments.before.join('\n');
-
-    if (cb) {
-      const cbNode = body instanceof resolveSeq.Collection && body.items[0] ? body.items[0] : body;
-      cbNode.commentBefore = cbNode.commentBefore ? `${cb}\n${cbNode.commentBefore}` : cb;
-    }
-
-    doc.comment = comments.after.join('\n') || null;
-  }
-}
-
-function resolveTagDirective({
-  tagPrefixes
-}, directive) {
-  const [handle, prefix] = directive.parameters;
-
-  if (!handle || !prefix) {
-    const msg = 'Insufficient parameters given for %TAG directive';
-    throw new PlainValue.YAMLSemanticError(directive, msg);
-  }
-
-  if (tagPrefixes.some(p => p.handle === handle)) {
-    const msg = 'The %TAG directive must only be given at most once per handle in the same document.';
-    throw new PlainValue.YAMLSemanticError(directive, msg);
-  }
-
-  return {
-    handle,
-    prefix
-  };
-}
-
-function resolveYamlDirective(doc, directive) {
-  let [version] = directive.parameters;
-  if (directive.name === 'YAML:1.0') version = '1.0';
-
-  if (!version) {
-    const msg = 'Insufficient parameters given for %YAML directive';
-    throw new PlainValue.YAMLSemanticError(directive, msg);
-  }
-
-  if (!documentOptions[version]) {
-    const v0 = doc.version || doc.options.version;
-    const msg = `Document will be parsed as YAML ${v0} rather than YAML ${version}`;
-    doc.warnings.push(new PlainValue.YAMLWarning(directive, msg));
-  }
-
-  return version;
-}
-
-function parseDirectives(doc, directives, prevDoc) {
-  const directiveComments = [];
-  let hasDirectives = false;
-
-  for (const directive of directives) {
-    const {
-      comment,
-      name
-    } = directive;
-
-    switch (name) {
-      case 'TAG':
-        try {
-          doc.tagPrefixes.push(resolveTagDirective(doc, directive));
-        } catch (error) {
-          doc.errors.push(error);
-        }
-
-        hasDirectives = true;
-        break;
-
-      case 'YAML':
-      case 'YAML:1.0':
-        if (doc.version) {
-          const msg = 'The %YAML directive must only be given at most once per document.';
-          doc.errors.push(new PlainValue.YAMLSemanticError(directive, msg));
-        }
-
-        try {
-          doc.version = resolveYamlDirective(doc, directive);
-        } catch (error) {
-          doc.errors.push(error);
-        }
-
-        hasDirectives = true;
-        break;
-
-      default:
-        if (name) {
-          const msg = `YAML only supports %TAG and %YAML directives, and not %${name}`;
-          doc.warnings.push(new PlainValue.YAMLWarning(directive, msg));
-        }
-
-    }
-
-    if (comment) directiveComments.push(comment);
-  }
-
-  if (prevDoc && !hasDirectives && '1.1' === (doc.version || prevDoc.version || doc.options.version)) {
-    const copyTagPrefix = ({
-      handle,
-      prefix
-    }) => ({
-      handle,
-      prefix
-    });
-
-    doc.tagPrefixes = prevDoc.tagPrefixes.map(copyTagPrefix);
-    doc.version = prevDoc.version;
-  }
-
-  doc.commentBefore = directiveComments.join('\n') || null;
-}
-
-function assertCollection(contents) {
-  if (contents instanceof resolveSeq.Collection) return true;
-  throw new Error('Expected a YAML collection as document contents');
-}
-
-class Document {
-  constructor(options) {
-    this.anchors = new Anchors(options.anchorPrefix);
-    this.commentBefore = null;
-    this.comment = null;
-    this.contents = null;
-    this.directivesEndMarker = null;
-    this.errors = [];
-    this.options = options;
-    this.schema = null;
-    this.tagPrefixes = [];
-    this.version = null;
-    this.warnings = [];
-  }
-
-  add(value) {
-    assertCollection(this.contents);
-    return this.contents.add(value);
-  }
-
-  addIn(path, value) {
-    assertCollection(this.contents);
-    this.contents.addIn(path, value);
-  }
-
-  delete(key) {
-    assertCollection(this.contents);
-    return this.contents.delete(key);
-  }
-
-  deleteIn(path) {
-    if (resolveSeq.isEmptyPath(path)) {
-      if (this.contents == null) return false;
-      this.contents = null;
-      return true;
-    }
-
-    assertCollection(this.contents);
-    return this.contents.deleteIn(path);
-  }
-
-  getDefaults() {
-    return Document.defaults[this.version] || Document.defaults[this.options.version] || {};
-  }
-
-  get(key, keepScalar) {
-    return this.contents instanceof resolveSeq.Collection ? this.contents.get(key, keepScalar) : undefined;
-  }
-
-  getIn(path, keepScalar) {
-    if (resolveSeq.isEmptyPath(path)) return !keepScalar && this.contents instanceof resolveSeq.Scalar ? this.contents.value : this.contents;
-    return this.contents instanceof resolveSeq.Collection ? this.contents.getIn(path, keepScalar) : undefined;
-  }
-
-  has(key) {
-    return this.contents instanceof resolveSeq.Collection ? this.contents.has(key) : false;
-  }
-
-  hasIn(path) {
-    if (resolveSeq.isEmptyPath(path)) return this.contents !== undefined;
-    return this.contents instanceof resolveSeq.Collection ? this.contents.hasIn(path) : false;
-  }
-
-  set(key, value) {
-    assertCollection(this.contents);
-    this.contents.set(key, value);
-  }
-
-  setIn(path, value) {
-    if (resolveSeq.isEmptyPath(path)) this.contents = value;else {
-      assertCollection(this.contents);
-      this.contents.setIn(path, value);
-    }
-  }
-
-  setSchema(id, customTags) {
-    if (!id && !customTags && this.schema) return;
-    if (typeof id === 'number') id = id.toFixed(1);
-
-    if (id === '1.0' || id === '1.1' || id === '1.2') {
-      if (this.version) this.version = id;else this.options.version = id;
-      delete this.options.schema;
-    } else if (id && typeof id === 'string') {
-      this.options.schema = id;
-    }
-
-    if (Array.isArray(customTags)) this.options.customTags = customTags;
-    const opt = Object.assign({}, this.getDefaults(), this.options);
-    this.schema = new Schema.Schema(opt);
-  }
-
-  parse(node, prevDoc) {
-    if (this.options.keepCstNodes) this.cstNode = node;
-    if (this.options.keepNodeTypes) this.type = 'DOCUMENT';
-    const {
-      directives = [],
-      contents = [],
-      directivesEndMarker,
-      error,
-      valueRange
-    } = node;
-
-    if (error) {
-      if (!error.source) error.source = this;
-      this.errors.push(error);
-    }
-
-    parseDirectives(this, directives, prevDoc);
-    if (directivesEndMarker) this.directivesEndMarker = true;
-    this.range = valueRange ? [valueRange.start, valueRange.end] : null;
-    this.setSchema();
-    this.anchors._cstAliases = [];
-    parseContents(this, contents);
-    this.anchors.resolveNodes();
-
-    if (this.options.prettyErrors) {
-      for (const error of this.errors) if (error instanceof PlainValue.YAMLError) error.makePretty();
-
-      for (const warn of this.warnings) if (warn instanceof PlainValue.YAMLError) warn.makePretty();
-    }
-
-    return this;
-  }
-
-  listNonDefaultTags() {
-    return listTagNames(this.contents).filter(t => t.indexOf(Schema.Schema.defaultPrefix) !== 0);
-  }
-
-  setTagPrefix(handle, prefix) {
-    if (handle[0] !== '!' || handle[handle.length - 1] !== '!') throw new Error('Handle must start and end with !');
-
-    if (prefix) {
-      const prev = this.tagPrefixes.find(p => p.handle === handle);
-      if (prev) prev.prefix = prefix;else this.tagPrefixes.push({
-        handle,
-        prefix
-      });
-    } else {
-      this.tagPrefixes = this.tagPrefixes.filter(p => p.handle !== handle);
-    }
-  }
-
-  toJSON(arg, onAnchor) {
-    const {
-      keepBlobsInJSON,
-      mapAsMap,
-      maxAliasCount
-    } = this.options;
-    const keep = keepBlobsInJSON && (typeof arg !== 'string' || !(this.contents instanceof resolveSeq.Scalar));
-    const ctx = {
-      doc: this,
-      indentStep: '  ',
-      keep,
-      mapAsMap: keep && !!mapAsMap,
-      maxAliasCount,
-      stringify // Requiring directly in Pair would create circular dependencies
-
-    };
-    const anchorNames = Object.keys(this.anchors.map);
-    if (anchorNames.length > 0) ctx.anchors = new Map(anchorNames.map(name => [this.anchors.map[name], {
-      alias: [],
-      aliasCount: 0,
-      count: 1
-    }]));
-    const res = resolveSeq.toJSON(this.contents, arg, ctx);
-    if (typeof onAnchor === 'function' && ctx.anchors) for (const {
-      count,
-      res
-    } of ctx.anchors.values()) onAnchor(res, count);
-    return res;
-  }
-
-  toString() {
-    if (this.errors.length > 0) throw new Error('Document with errors cannot be stringified');
-    const indentSize = this.options.indent;
-
-    if (!Number.isInteger(indentSize) || indentSize <= 0) {
-      const s = JSON.stringify(indentSize);
-      throw new Error(`"indent" option must be a positive integer, not ${s}`);
-    }
-
-    this.setSchema();
-    const lines = [];
-    let hasDirectives = false;
-
-    if (this.version) {
-      let vd = '%YAML 1.2';
-
-      if (this.schema.name === 'yaml-1.1') {
-        if (this.version === '1.0') vd = '%YAML:1.0';else if (this.version === '1.1') vd = '%YAML 1.1';
-      }
-
-      lines.push(vd);
-      hasDirectives = true;
-    }
-
-    const tagNames = this.listNonDefaultTags();
-    this.tagPrefixes.forEach(({
-      handle,
-      prefix
-    }) => {
-      if (tagNames.some(t => t.indexOf(prefix) === 0)) {
-        lines.push(`%TAG ${handle} ${prefix}`);
-        hasDirectives = true;
-      }
-    });
-    if (hasDirectives || this.directivesEndMarker) lines.push('---');
-
-    if (this.commentBefore) {
-      if (hasDirectives || !this.directivesEndMarker) lines.unshift('');
-      lines.unshift(this.commentBefore.replace(/^/gm, '#'));
-    }
-
-    const ctx = {
-      anchors: {},
-      doc: this,
-      indent: '',
-      indentStep: ' '.repeat(indentSize),
-      stringify // Requiring directly in nodes would create circular dependencies
-
-    };
-    let chompKeep = false;
-    let contentComment = null;
-
-    if (this.contents) {
-      if (this.contents instanceof resolveSeq.Node) {
-        if (this.contents.spaceBefore && (hasDirectives || this.directivesEndMarker)) lines.push('');
-        if (this.contents.commentBefore) lines.push(this.contents.commentBefore.replace(/^/gm, '#')); // top-level block scalars need to be indented if followed by a comment
-
-        ctx.forceBlockIndent = !!this.comment;
-        contentComment = this.contents.comment;
-      }
-
-      const onChompKeep = contentComment ? null : () => chompKeep = true;
-      const body = stringify(this.contents, ctx, () => contentComment = null, onChompKeep);
-      lines.push(resolveSeq.addComment(body, '', contentComment));
-    } else if (this.contents !== undefined) {
-      lines.push(stringify(this.contents, ctx));
-    }
-
-    if (this.comment) {
-      if ((!chompKeep || contentComment) && lines[lines.length - 1] !== '') lines.push('');
-      lines.push(this.comment.replace(/^/gm, '#'));
-    }
-
-    return lines.join('\n') + '\n';
-  }
-
-}
-
-PlainValue._defineProperty(Document, "defaults", documentOptions);
-
-exports.Document = Document;
-exports.defaultOptions = defaultOptions;
-exports.scalarOptions = scalarOptions;
-
-
-/***/ }),
-
 /***/ 208:
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -4338,14 +3579,12 @@ module.exports = baseUnary;
 /***/ 234:
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
-var isObject = __webpack_require__(988),
+var baseTrim = __webpack_require__(782),
+    isObject = __webpack_require__(988),
     isSymbol = __webpack_require__(186);
 
 /** Used as references for various `Number` constants. */
 var NAN = 0 / 0;
-
-/** Used to match leading and trailing whitespace. */
-var reTrim = /^\s+|\s+$/g;
 
 /** Used to detect bad signed hexadecimal string values. */
 var reIsBadHex = /^[-+]0x[0-9a-f]+$/i;
@@ -4396,7 +3635,7 @@ function toNumber(value) {
   if (typeof value != 'string') {
     return value === 0 ? value : +value;
   }
-  value = value.replace(reTrim, '');
+  value = baseTrim(value);
   var isBinary = reIsBinary.test(value);
   return (isBinary || reIsOctal.test(value))
     ? freeParseInt(value.slice(2), isBinary ? 2 : 8)
@@ -4495,34 +3734,457 @@ exports.Context = Context;
 /***/ 280:
 /***/ (function(module) {
 
-module.exports = register
+module.exports = register;
 
-function register (state, name, method, options) {
-  if (typeof method !== 'function') {
-    throw new Error('method for before hook must be a function')
+function register(state, name, method, options) {
+  if (typeof method !== "function") {
+    throw new Error("method for before hook must be a function");
   }
 
   if (!options) {
-    options = {}
+    options = {};
   }
 
   if (Array.isArray(name)) {
     return name.reverse().reduce(function (callback, name) {
-      return register.bind(null, state, name, callback, options)
-    }, method)()
+      return register.bind(null, state, name, callback, options);
+    }, method)();
   }
 
-  return Promise.resolve()
-    .then(function () {
-      if (!state.registry[name]) {
-        return method(options)
+  return Promise.resolve().then(function () {
+    if (!state.registry[name]) {
+      return method(options);
+    }
+
+    return state.registry[name].reduce(function (method, registered) {
+      return registered.hook.bind(null, method, options);
+    }, method)();
+  });
+}
+
+
+/***/ }),
+
+/***/ 287:
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+var PlainValue = __webpack_require__(513);
+var resolveSeq = __webpack_require__(329);
+
+/* global atob, btoa, Buffer */
+const binary = {
+  identify: value => value instanceof Uint8Array,
+  // Buffer inherits from Uint8Array
+  default: false,
+  tag: 'tag:yaml.org,2002:binary',
+
+  /**
+   * Returns a Buffer in node and an Uint8Array in browsers
+   *
+   * To use the resulting buffer as an image, you'll want to do something like:
+   *
+   *   const blob = new Blob([buffer], { type: 'image/jpeg' })
+   *   document.querySelector('#photo').src = URL.createObjectURL(blob)
+   */
+  resolve: (doc, node) => {
+    const src = resolveSeq.resolveString(doc, node);
+
+    if (typeof Buffer === 'function') {
+      return Buffer.from(src, 'base64');
+    } else if (typeof atob === 'function') {
+      // On IE 11, atob() can't handle newlines
+      const str = atob(src.replace(/[\n\r]/g, ''));
+      const buffer = new Uint8Array(str.length);
+
+      for (let i = 0; i < str.length; ++i) buffer[i] = str.charCodeAt(i);
+
+      return buffer;
+    } else {
+      const msg = 'This environment does not support reading binary tags; either Buffer or atob is required';
+      doc.errors.push(new PlainValue.YAMLReferenceError(node, msg));
+      return null;
+    }
+  },
+  options: resolveSeq.binaryOptions,
+  stringify: ({
+    comment,
+    type,
+    value
+  }, ctx, onComment, onChompKeep) => {
+    let src;
+
+    if (typeof Buffer === 'function') {
+      src = value instanceof Buffer ? value.toString('base64') : Buffer.from(value.buffer).toString('base64');
+    } else if (typeof btoa === 'function') {
+      let s = '';
+
+      for (let i = 0; i < value.length; ++i) s += String.fromCharCode(value[i]);
+
+      src = btoa(s);
+    } else {
+      throw new Error('This environment does not support writing binary tags; either Buffer or btoa is required');
+    }
+
+    if (!type) type = resolveSeq.binaryOptions.defaultType;
+
+    if (type === PlainValue.Type.QUOTE_DOUBLE) {
+      value = src;
+    } else {
+      const {
+        lineWidth
+      } = resolveSeq.binaryOptions;
+      const n = Math.ceil(src.length / lineWidth);
+      const lines = new Array(n);
+
+      for (let i = 0, o = 0; i < n; ++i, o += lineWidth) {
+        lines[i] = src.substr(o, lineWidth);
       }
 
-      return (state.registry[name]).reduce(function (method, registered) {
-        return registered.hook.bind(null, method, options)
-      }, method)()
-    })
+      value = lines.join(type === PlainValue.Type.BLOCK_LITERAL ? '\n' : ' ');
+    }
+
+    return resolveSeq.stringifyString({
+      comment,
+      type,
+      value
+    }, ctx, onComment, onChompKeep);
+  }
+};
+
+function parsePairs(doc, cst) {
+  const seq = resolveSeq.resolveSeq(doc, cst);
+
+  for (let i = 0; i < seq.items.length; ++i) {
+    let item = seq.items[i];
+    if (item instanceof resolveSeq.Pair) continue;else if (item instanceof resolveSeq.YAMLMap) {
+      if (item.items.length > 1) {
+        const msg = 'Each pair must have its own sequence indicator';
+        throw new PlainValue.YAMLSemanticError(cst, msg);
+      }
+
+      const pair = item.items[0] || new resolveSeq.Pair();
+      if (item.commentBefore) pair.commentBefore = pair.commentBefore ? `${item.commentBefore}\n${pair.commentBefore}` : item.commentBefore;
+      if (item.comment) pair.comment = pair.comment ? `${item.comment}\n${pair.comment}` : item.comment;
+      item = pair;
+    }
+    seq.items[i] = item instanceof resolveSeq.Pair ? item : new resolveSeq.Pair(item);
+  }
+
+  return seq;
 }
+function createPairs(schema, iterable, ctx) {
+  const pairs = new resolveSeq.YAMLSeq(schema);
+  pairs.tag = 'tag:yaml.org,2002:pairs';
+
+  for (const it of iterable) {
+    let key, value;
+
+    if (Array.isArray(it)) {
+      if (it.length === 2) {
+        key = it[0];
+        value = it[1];
+      } else throw new TypeError(`Expected [key, value] tuple: ${it}`);
+    } else if (it && it instanceof Object) {
+      const keys = Object.keys(it);
+
+      if (keys.length === 1) {
+        key = keys[0];
+        value = it[key];
+      } else throw new TypeError(`Expected { key: value } tuple: ${it}`);
+    } else {
+      key = it;
+    }
+
+    const pair = schema.createPair(key, value, ctx);
+    pairs.items.push(pair);
+  }
+
+  return pairs;
+}
+const pairs = {
+  default: false,
+  tag: 'tag:yaml.org,2002:pairs',
+  resolve: parsePairs,
+  createNode: createPairs
+};
+
+class YAMLOMap extends resolveSeq.YAMLSeq {
+  constructor() {
+    super();
+
+    PlainValue._defineProperty(this, "add", resolveSeq.YAMLMap.prototype.add.bind(this));
+
+    PlainValue._defineProperty(this, "delete", resolveSeq.YAMLMap.prototype.delete.bind(this));
+
+    PlainValue._defineProperty(this, "get", resolveSeq.YAMLMap.prototype.get.bind(this));
+
+    PlainValue._defineProperty(this, "has", resolveSeq.YAMLMap.prototype.has.bind(this));
+
+    PlainValue._defineProperty(this, "set", resolveSeq.YAMLMap.prototype.set.bind(this));
+
+    this.tag = YAMLOMap.tag;
+  }
+
+  toJSON(_, ctx) {
+    const map = new Map();
+    if (ctx && ctx.onCreate) ctx.onCreate(map);
+
+    for (const pair of this.items) {
+      let key, value;
+
+      if (pair instanceof resolveSeq.Pair) {
+        key = resolveSeq.toJSON(pair.key, '', ctx);
+        value = resolveSeq.toJSON(pair.value, key, ctx);
+      } else {
+        key = resolveSeq.toJSON(pair, '', ctx);
+      }
+
+      if (map.has(key)) throw new Error('Ordered maps must not include duplicate keys');
+      map.set(key, value);
+    }
+
+    return map;
+  }
+
+}
+
+PlainValue._defineProperty(YAMLOMap, "tag", 'tag:yaml.org,2002:omap');
+
+function parseOMap(doc, cst) {
+  const pairs = parsePairs(doc, cst);
+  const seenKeys = [];
+
+  for (const {
+    key
+  } of pairs.items) {
+    if (key instanceof resolveSeq.Scalar) {
+      if (seenKeys.includes(key.value)) {
+        const msg = 'Ordered maps must not include duplicate keys';
+        throw new PlainValue.YAMLSemanticError(cst, msg);
+      } else {
+        seenKeys.push(key.value);
+      }
+    }
+  }
+
+  return Object.assign(new YAMLOMap(), pairs);
+}
+
+function createOMap(schema, iterable, ctx) {
+  const pairs = createPairs(schema, iterable, ctx);
+  const omap = new YAMLOMap();
+  omap.items = pairs.items;
+  return omap;
+}
+
+const omap = {
+  identify: value => value instanceof Map,
+  nodeClass: YAMLOMap,
+  default: false,
+  tag: 'tag:yaml.org,2002:omap',
+  resolve: parseOMap,
+  createNode: createOMap
+};
+
+class YAMLSet extends resolveSeq.YAMLMap {
+  constructor() {
+    super();
+    this.tag = YAMLSet.tag;
+  }
+
+  add(key) {
+    const pair = key instanceof resolveSeq.Pair ? key : new resolveSeq.Pair(key);
+    const prev = resolveSeq.findPair(this.items, pair.key);
+    if (!prev) this.items.push(pair);
+  }
+
+  get(key, keepPair) {
+    const pair = resolveSeq.findPair(this.items, key);
+    return !keepPair && pair instanceof resolveSeq.Pair ? pair.key instanceof resolveSeq.Scalar ? pair.key.value : pair.key : pair;
+  }
+
+  set(key, value) {
+    if (typeof value !== 'boolean') throw new Error(`Expected boolean value for set(key, value) in a YAML set, not ${typeof value}`);
+    const prev = resolveSeq.findPair(this.items, key);
+
+    if (prev && !value) {
+      this.items.splice(this.items.indexOf(prev), 1);
+    } else if (!prev && value) {
+      this.items.push(new resolveSeq.Pair(key));
+    }
+  }
+
+  toJSON(_, ctx) {
+    return super.toJSON(_, ctx, Set);
+  }
+
+  toString(ctx, onComment, onChompKeep) {
+    if (!ctx) return JSON.stringify(this);
+    if (this.hasAllNullValues()) return super.toString(ctx, onComment, onChompKeep);else throw new Error('Set items must all have null values');
+  }
+
+}
+
+PlainValue._defineProperty(YAMLSet, "tag", 'tag:yaml.org,2002:set');
+
+function parseSet(doc, cst) {
+  const map = resolveSeq.resolveMap(doc, cst);
+  if (!map.hasAllNullValues()) throw new PlainValue.YAMLSemanticError(cst, 'Set items must all have null values');
+  return Object.assign(new YAMLSet(), map);
+}
+
+function createSet(schema, iterable, ctx) {
+  const set = new YAMLSet();
+
+  for (const value of iterable) set.items.push(schema.createPair(value, null, ctx));
+
+  return set;
+}
+
+const set = {
+  identify: value => value instanceof Set,
+  nodeClass: YAMLSet,
+  default: false,
+  tag: 'tag:yaml.org,2002:set',
+  resolve: parseSet,
+  createNode: createSet
+};
+
+const parseSexagesimal = (sign, parts) => {
+  const n = parts.split(':').reduce((n, p) => n * 60 + Number(p), 0);
+  return sign === '-' ? -n : n;
+}; // hhhh:mm:ss.sss
+
+
+const stringifySexagesimal = ({
+  value
+}) => {
+  if (isNaN(value) || !isFinite(value)) return resolveSeq.stringifyNumber(value);
+  let sign = '';
+
+  if (value < 0) {
+    sign = '-';
+    value = Math.abs(value);
+  }
+
+  const parts = [value % 60]; // seconds, including ms
+
+  if (value < 60) {
+    parts.unshift(0); // at least one : is required
+  } else {
+    value = Math.round((value - parts[0]) / 60);
+    parts.unshift(value % 60); // minutes
+
+    if (value >= 60) {
+      value = Math.round((value - parts[0]) / 60);
+      parts.unshift(value); // hours
+    }
+  }
+
+  return sign + parts.map(n => n < 10 ? '0' + String(n) : String(n)).join(':').replace(/000000\d*$/, '') // % 60 may introduce error
+  ;
+};
+
+const intTime = {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'TIME',
+  test: /^([-+]?)([0-9][0-9_]*(?::[0-5]?[0-9])+)$/,
+  resolve: (str, sign, parts) => parseSexagesimal(sign, parts.replace(/_/g, '')),
+  stringify: stringifySexagesimal
+};
+const floatTime = {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  format: 'TIME',
+  test: /^([-+]?)([0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*)$/,
+  resolve: (str, sign, parts) => parseSexagesimal(sign, parts.replace(/_/g, '')),
+  stringify: stringifySexagesimal
+};
+const timestamp = {
+  identify: value => value instanceof Date,
+  default: true,
+  tag: 'tag:yaml.org,2002:timestamp',
+  // If the time zone is omitted, the timestamp is assumed to be specified in UTC. The time part
+  // may be omitted altogether, resulting in a date format. In such a case, the time part is
+  // assumed to be 00:00:00Z (start of day, UTC).
+  test: RegExp('^(?:' + '([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})' + // YYYY-Mm-Dd
+  '(?:(?:t|T|[ \\t]+)' + // t | T | whitespace
+  '([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}(\\.[0-9]+)?)' + // Hh:Mm:Ss(.ss)?
+  '(?:[ \\t]*(Z|[-+][012]?[0-9](?::[0-9]{2})?))?' + // Z | +5 | -03:30
+  ')?' + ')$'),
+  resolve: (str, year, month, day, hour, minute, second, millisec, tz) => {
+    if (millisec) millisec = (millisec + '00').substr(1, 3);
+    let date = Date.UTC(year, month - 1, day, hour || 0, minute || 0, second || 0, millisec || 0);
+
+    if (tz && tz !== 'Z') {
+      let d = parseSexagesimal(tz[0], tz.slice(1));
+      if (Math.abs(d) < 30) d *= 60;
+      date -= 60000 * d;
+    }
+
+    return new Date(date);
+  },
+  stringify: ({
+    value
+  }) => value.toISOString().replace(/((T00:00)?:00)?\.000Z$/, '')
+};
+
+/* global console, process, YAML_SILENCE_DEPRECATION_WARNINGS, YAML_SILENCE_WARNINGS */
+function shouldWarn(deprecation) {
+  const env = typeof process !== 'undefined' && process.env || {};
+
+  if (deprecation) {
+    if (typeof YAML_SILENCE_DEPRECATION_WARNINGS !== 'undefined') return !YAML_SILENCE_DEPRECATION_WARNINGS;
+    return !env.YAML_SILENCE_DEPRECATION_WARNINGS;
+  }
+
+  if (typeof YAML_SILENCE_WARNINGS !== 'undefined') return !YAML_SILENCE_WARNINGS;
+  return !env.YAML_SILENCE_WARNINGS;
+}
+
+function warn(warning, type) {
+  if (shouldWarn(false)) {
+    const emit = typeof process !== 'undefined' && process.emitWarning; // This will throw in Jest if `warning` is an Error instance due to
+    // https://github.com/facebook/jest/issues/2549
+
+    if (emit) emit(warning, type);else {
+      // eslint-disable-next-line no-console
+      console.warn(type ? `${type}: ${warning}` : warning);
+    }
+  }
+}
+function warnFileDeprecation(filename) {
+  if (shouldWarn(true)) {
+    const path = filename.replace(/.*yaml[/\\]/i, '').replace(/\.js$/, '').replace(/\\/g, '/');
+    warn(`The endpoint 'yaml/${path}' will be removed in a future release.`, 'DeprecationWarning');
+  }
+}
+const warned = {};
+function warnOptionDeprecation(name, alternative) {
+  if (!warned[name] && shouldWarn(true)) {
+    warned[name] = true;
+    let msg = `The option '${name}' will be removed in a future release`;
+    msg += alternative ? `, use '${alternative}' instead.` : '.';
+    warn(msg, 'DeprecationWarning');
+  }
+}
+
+exports.binary = binary;
+exports.floatTime = floatTime;
+exports.intTime = intTime;
+exports.omap = omap;
+exports.pairs = pairs;
+exports.set = set;
+exports.timestamp = timestamp;
+exports.warn = warn;
+exports.warnFileDeprecation = warnFileDeprecation;
+exports.warnOptionDeprecation = warnOptionDeprecation;
 
 
 /***/ }),
@@ -4535,7 +4197,7 @@ function register (state, name, method, options) {
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
-const VERSION = "2.3.0";
+const VERSION = "2.13.2";
 
 /**
  * Some “list” response that can be paginated have a different response structure
@@ -4588,26 +4250,23 @@ function iterator(octokit, route, parameters) {
   let url = options.url;
   return {
     [Symbol.asyncIterator]: () => ({
-      next() {
-        if (!url) {
-          return Promise.resolve({
-            done: true
-          });
-        }
-
-        return requestMethod({
+      async next() {
+        if (!url) return {
+          done: true
+        };
+        const response = await requestMethod({
           method,
           url,
           headers
-        }).then(normalizePaginatedListResponse).then(response => {
-          // `response.headers.link` format:
-          // '<https://api.github.com/users/aseemk/followers?page=2>; rel="next", <https://api.github.com/users/aseemk/followers?page=2>; rel="last"'
-          // sets `url` to undefined if "next" URL is not present or `link` header is not set
-          url = ((response.headers.link || "").match(/<([^>]+)>;\s*rel="next"/) || [])[1];
-          return {
-            value: response
-          };
         });
+        const normalizedResponse = normalizePaginatedListResponse(response); // `response.headers.link` format:
+        // '<https://api.github.com/users/aseemk/followers?page=2>; rel="next", <https://api.github.com/users/aseemk/followers?page=2>; rel="last"'
+        // sets `url` to undefined if "next" URL is not present or `link` header is not set
+
+        url = ((normalizedResponse.headers.link || "").match(/<([^>]+)>;\s*rel="next"/) || [])[1];
+        return {
+          value: normalizedResponse
+        };
       }
 
     })
@@ -4645,6 +4304,20 @@ function gather(octokit, results, iterator, mapFn) {
   });
 }
 
+const composePaginateRest = Object.assign(paginate, {
+  iterator
+});
+
+const paginatingEndpoints = ["GET /app/installations", "GET /applications/grants", "GET /authorizations", "GET /enterprises/{enterprise}/actions/permissions/organizations", "GET /enterprises/{enterprise}/actions/runner-groups", "GET /enterprises/{enterprise}/actions/runner-groups/{runner_group_id}/organizations", "GET /enterprises/{enterprise}/actions/runner-groups/{runner_group_id}/runners", "GET /enterprises/{enterprise}/actions/runners", "GET /enterprises/{enterprise}/actions/runners/downloads", "GET /events", "GET /gists", "GET /gists/public", "GET /gists/starred", "GET /gists/{gist_id}/comments", "GET /gists/{gist_id}/commits", "GET /gists/{gist_id}/forks", "GET /installation/repositories", "GET /issues", "GET /marketplace_listing/plans", "GET /marketplace_listing/plans/{plan_id}/accounts", "GET /marketplace_listing/stubbed/plans", "GET /marketplace_listing/stubbed/plans/{plan_id}/accounts", "GET /networks/{owner}/{repo}/events", "GET /notifications", "GET /organizations", "GET /orgs/{org}/actions/permissions/repositories", "GET /orgs/{org}/actions/runner-groups", "GET /orgs/{org}/actions/runner-groups/{runner_group_id}/repositories", "GET /orgs/{org}/actions/runner-groups/{runner_group_id}/runners", "GET /orgs/{org}/actions/runners", "GET /orgs/{org}/actions/runners/downloads", "GET /orgs/{org}/actions/secrets", "GET /orgs/{org}/actions/secrets/{secret_name}/repositories", "GET /orgs/{org}/blocks", "GET /orgs/{org}/credential-authorizations", "GET /orgs/{org}/events", "GET /orgs/{org}/failed_invitations", "GET /orgs/{org}/hooks", "GET /orgs/{org}/installations", "GET /orgs/{org}/invitations", "GET /orgs/{org}/invitations/{invitation_id}/teams", "GET /orgs/{org}/issues", "GET /orgs/{org}/members", "GET /orgs/{org}/migrations", "GET /orgs/{org}/migrations/{migration_id}/repositories", "GET /orgs/{org}/outside_collaborators", "GET /orgs/{org}/projects", "GET /orgs/{org}/public_members", "GET /orgs/{org}/repos", "GET /orgs/{org}/team-sync/groups", "GET /orgs/{org}/teams", "GET /orgs/{org}/teams/{team_slug}/discussions", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/comments/{comment_number}/reactions", "GET /orgs/{org}/teams/{team_slug}/discussions/{discussion_number}/reactions", "GET /orgs/{org}/teams/{team_slug}/invitations", "GET /orgs/{org}/teams/{team_slug}/members", "GET /orgs/{org}/teams/{team_slug}/projects", "GET /orgs/{org}/teams/{team_slug}/repos", "GET /orgs/{org}/teams/{team_slug}/team-sync/group-mappings", "GET /orgs/{org}/teams/{team_slug}/teams", "GET /projects/columns/{column_id}/cards", "GET /projects/{project_id}/collaborators", "GET /projects/{project_id}/columns", "GET /repos/{owner}/{repo}/actions/artifacts", "GET /repos/{owner}/{repo}/actions/runners", "GET /repos/{owner}/{repo}/actions/runners/downloads", "GET /repos/{owner}/{repo}/actions/runs", "GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts", "GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs", "GET /repos/{owner}/{repo}/actions/secrets", "GET /repos/{owner}/{repo}/actions/workflows", "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs", "GET /repos/{owner}/{repo}/assignees", "GET /repos/{owner}/{repo}/branches", "GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations", "GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs", "GET /repos/{owner}/{repo}/code-scanning/alerts", "GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/instances", "GET /repos/{owner}/{repo}/code-scanning/analyses", "GET /repos/{owner}/{repo}/collaborators", "GET /repos/{owner}/{repo}/comments", "GET /repos/{owner}/{repo}/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/commits", "GET /repos/{owner}/{repo}/commits/{commit_sha}/branches-where-head", "GET /repos/{owner}/{repo}/commits/{commit_sha}/comments", "GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls", "GET /repos/{owner}/{repo}/commits/{ref}/check-runs", "GET /repos/{owner}/{repo}/commits/{ref}/check-suites", "GET /repos/{owner}/{repo}/commits/{ref}/statuses", "GET /repos/{owner}/{repo}/contributors", "GET /repos/{owner}/{repo}/deployments", "GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses", "GET /repos/{owner}/{repo}/events", "GET /repos/{owner}/{repo}/forks", "GET /repos/{owner}/{repo}/git/matching-refs/{ref}", "GET /repos/{owner}/{repo}/hooks", "GET /repos/{owner}/{repo}/invitations", "GET /repos/{owner}/{repo}/issues", "GET /repos/{owner}/{repo}/issues/comments", "GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/issues/events", "GET /repos/{owner}/{repo}/issues/{issue_number}/comments", "GET /repos/{owner}/{repo}/issues/{issue_number}/events", "GET /repos/{owner}/{repo}/issues/{issue_number}/labels", "GET /repos/{owner}/{repo}/issues/{issue_number}/reactions", "GET /repos/{owner}/{repo}/issues/{issue_number}/timeline", "GET /repos/{owner}/{repo}/keys", "GET /repos/{owner}/{repo}/labels", "GET /repos/{owner}/{repo}/milestones", "GET /repos/{owner}/{repo}/milestones/{milestone_number}/labels", "GET /repos/{owner}/{repo}/notifications", "GET /repos/{owner}/{repo}/pages/builds", "GET /repos/{owner}/{repo}/projects", "GET /repos/{owner}/{repo}/pulls", "GET /repos/{owner}/{repo}/pulls/comments", "GET /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", "GET /repos/{owner}/{repo}/pulls/{pull_number}/comments", "GET /repos/{owner}/{repo}/pulls/{pull_number}/commits", "GET /repos/{owner}/{repo}/pulls/{pull_number}/files", "GET /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers", "GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews", "GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews/{review_id}/comments", "GET /repos/{owner}/{repo}/releases", "GET /repos/{owner}/{repo}/releases/{release_id}/assets", "GET /repos/{owner}/{repo}/secret-scanning/alerts", "GET /repos/{owner}/{repo}/stargazers", "GET /repos/{owner}/{repo}/subscribers", "GET /repos/{owner}/{repo}/tags", "GET /repos/{owner}/{repo}/teams", "GET /repositories", "GET /repositories/{repository_id}/environments/{environment_name}/secrets", "GET /scim/v2/enterprises/{enterprise}/Groups", "GET /scim/v2/enterprises/{enterprise}/Users", "GET /scim/v2/organizations/{org}/Users", "GET /search/code", "GET /search/commits", "GET /search/issues", "GET /search/labels", "GET /search/repositories", "GET /search/topics", "GET /search/users", "GET /teams/{team_id}/discussions", "GET /teams/{team_id}/discussions/{discussion_number}/comments", "GET /teams/{team_id}/discussions/{discussion_number}/comments/{comment_number}/reactions", "GET /teams/{team_id}/discussions/{discussion_number}/reactions", "GET /teams/{team_id}/invitations", "GET /teams/{team_id}/members", "GET /teams/{team_id}/projects", "GET /teams/{team_id}/repos", "GET /teams/{team_id}/team-sync/group-mappings", "GET /teams/{team_id}/teams", "GET /user/blocks", "GET /user/emails", "GET /user/followers", "GET /user/following", "GET /user/gpg_keys", "GET /user/installations", "GET /user/installations/{installation_id}/repositories", "GET /user/issues", "GET /user/keys", "GET /user/marketplace_purchases", "GET /user/marketplace_purchases/stubbed", "GET /user/memberships/orgs", "GET /user/migrations", "GET /user/migrations/{migration_id}/repositories", "GET /user/orgs", "GET /user/public_emails", "GET /user/repos", "GET /user/repository_invitations", "GET /user/starred", "GET /user/subscriptions", "GET /user/teams", "GET /users", "GET /users/{username}/events", "GET /users/{username}/events/orgs/{org}", "GET /users/{username}/events/public", "GET /users/{username}/followers", "GET /users/{username}/following", "GET /users/{username}/gists", "GET /users/{username}/gpg_keys", "GET /users/{username}/keys", "GET /users/{username}/orgs", "GET /users/{username}/projects", "GET /users/{username}/received_events", "GET /users/{username}/received_events/public", "GET /users/{username}/repos", "GET /users/{username}/starred", "GET /users/{username}/subscriptions"];
+
+function isPaginatingEndpoint(arg) {
+  if (typeof arg === "string") {
+    return paginatingEndpoints.includes(arg);
+  } else {
+    return false;
+  }
+}
+
 /**
  * @param octokit Octokit instance
  * @param options Options passed to Octokit constructor
@@ -4659,7 +4332,10 @@ function paginateRest(octokit) {
 }
 paginateRest.VERSION = VERSION;
 
+exports.composePaginateRest = composePaginateRest;
+exports.isPaginatingEndpoint = isPaginatingEndpoint;
 exports.paginateRest = paginateRest;
+exports.paginatingEndpoints = paginatingEndpoints;
 //# sourceMappingURL=index.js.map
 
 
@@ -4897,7 +4573,7 @@ function expand(str, isTop) {
 
 /***/ }),
 
-/***/ 310:
+/***/ 329:
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
@@ -4955,9 +4631,21 @@ function collectionFromPath(schema, path, value) {
 
   for (let i = path.length - 1; i >= 0; --i) {
     const k = path[i];
-    const o = Number.isInteger(k) && k >= 0 ? [] : {};
-    o[k] = v;
-    v = o;
+
+    if (Number.isInteger(k) && k >= 0) {
+      const a = [];
+      a[k] = v;
+      v = a;
+    } else {
+      const o = {};
+      Object.defineProperty(o, k, {
+        value: v,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });
+      v = o;
+    }
   }
 
   return schema.createNode(v, false);
@@ -5181,7 +4869,7 @@ const stringifyKey = (key, jsKey, ctx) => {
   if (jsKey === null) return '';
   if (typeof jsKey !== 'object') return String(jsKey);
   if (key instanceof Node && ctx && ctx.doc) return key.toString({
-    anchors: {},
+    anchors: Object.create(null),
     doc: ctx.doc,
     indent: '',
     indentStep: ctx.indentStep,
@@ -5222,7 +4910,13 @@ class Pair extends Node {
       map.add(key);
     } else {
       const stringKey = stringifyKey(this.key, key, ctx);
-      map[stringKey] = toJSON(this.value, stringKey, ctx);
+      const value = toJSON(this.value, stringKey, ctx);
+      if (stringKey in map) Object.defineProperty(map, stringKey, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      });else map[stringKey] = value;
     }
 
     return map;
@@ -5257,7 +4951,7 @@ class Pair extends Node {
       }
     }
 
-    const explicitKey = !simpleKeys && (!key || keyComment || key instanceof Collection || key.type === PlainValue.Type.BLOCK_FOLDED || key.type === PlainValue.Type.BLOCK_LITERAL);
+    let explicitKey = !simpleKeys && (!key || keyComment || (key instanceof Node ? key instanceof Collection || key.type === PlainValue.Type.BLOCK_FOLDED || key.type === PlainValue.Type.BLOCK_LITERAL : typeof key === 'object'));
     const {
       doc,
       indent,
@@ -5272,13 +4966,18 @@ class Pair extends Node {
     let str = stringify(key, ctx, () => keyComment = null, () => chompKeep = true);
     str = addComment(str, ctx.indent, keyComment);
 
+    if (!explicitKey && str.length > 1024) {
+      if (simpleKeys) throw new Error('With simple keys, single line scalar must not span more than 1024 characters');
+      explicitKey = true;
+    }
+
     if (ctx.allNullValues && !simpleKeys) {
       if (this.comment) {
         str = addComment(str, ctx.indent, this.comment);
         if (onComment) onComment();
       } else if (chompKeep && !keyComment && onChompKeep) onChompKeep();
 
-      return ctx.inFlow ? str : `? ${str}`;
+      return ctx.inFlow && !explicitKey ? str : `? ${str}`;
     }
 
     str = explicitKey ? `? ${str}\n${indent}:` : `${str}:`;
@@ -5322,7 +5021,7 @@ class Pair extends Node {
     } else if (!explicitKey && value instanceof Collection) {
       const flow = valueStr[0] === '[' || valueStr[0] === '{';
       if (!flow || valueStr.includes('\n')) ws = `\n${ctx.indent}`;
-    }
+    } else if (valueStr[0] === '\n') ws = '';
 
     if (chompKeep && !valueComment && onChompKeep) onChompKeep();
     return addComment(str + ws + valueStr, ctx.indent, valueComment);
@@ -5546,8 +5245,13 @@ class Merge extends Pair {
           if (!map.has(key)) map.set(key, value);
         } else if (map instanceof Set) {
           map.add(key);
-        } else {
-          if (!Object.prototype.hasOwnProperty.call(map, key)) map[key] = value;
+        } else if (!Object.prototype.hasOwnProperty.call(map, key)) {
+          Object.defineProperty(map, key, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true
+          });
         }
       }
     }
@@ -5647,7 +5351,7 @@ const consumeMoreIndentedLines = (text, i) => {
  *   the first line, defaulting to `indent.length`
  * @param {number} [options.lineWidth=80]
  * @param {number} [options.minContentWidth=20] Allow highly indented lines to
- *   stretch the line width
+ *   stretch the line width or indent content from the start
  * @param {function} options.onFold Called once if the text is folded
  * @param {function} options.onFold Called once if any line of text exceeds
  *   lineWidth characters
@@ -5666,11 +5370,18 @@ function foldFlowLines(text, indent, mode, {
   if (text.length <= endStep) return text;
   const folds = [];
   const escapedFolds = {};
-  let end = lineWidth - (typeof indentAtStart === 'number' ? indentAtStart : indent.length);
+  let end = lineWidth - indent.length;
+
+  if (typeof indentAtStart === 'number') {
+    if (indentAtStart > lineWidth - Math.max(2, minContentWidth)) folds.push(0);else end = lineWidth - indentAtStart;
+  }
+
   let split = undefined;
   let prev = undefined;
   let overflow = false;
   let i = -1;
+  let escStart = -1;
+  let escEnd = -1;
 
   if (mode === FOLD_BLOCK) {
     i = consumeMoreIndentedLines(text, i);
@@ -5679,6 +5390,8 @@ function foldFlowLines(text, indent, mode, {
 
   for (let ch; ch = text[i += 1];) {
     if (mode === FOLD_QUOTED && ch === '\\') {
+      escStart = i;
+
       switch (text[i + 1]) {
         case 'x':
           i += 3;
@@ -5695,6 +5408,8 @@ function foldFlowLines(text, indent, mode, {
         default:
           i += 1;
       }
+
+      escEnd = i;
     }
 
     if (ch === '\n') {
@@ -5719,12 +5434,15 @@ function foldFlowLines(text, indent, mode, {
             prev = ch;
             ch = text[i += 1];
             overflow = true;
-          } // i - 2 accounts for not-dropped last char + newline-escaping \
+          } // Account for newline escape, but don't break preceding escape
 
 
-          folds.push(i - 2);
-          escapedFolds[i - 2] = true;
-          end = i - 2 + endStep;
+          const j = i > escEnd + 1 ? i - 2 : escStart - 1; // Bail out if lineWidth & minContentWidth are shorter than an escape string
+
+          if (escapedFolds[j]) return text;
+          folds.push(j);
+          escapedFolds[j] = true;
+          end = j + endStep;
           split = undefined;
         } else {
           overflow = true;
@@ -5743,8 +5461,10 @@ function foldFlowLines(text, indent, mode, {
   for (let i = 0; i < folds.length; ++i) {
     const fold = folds[i];
     const end = folds[i + 1] || text.length;
-    if (mode === FOLD_QUOTED && escapedFolds[fold]) res += `${text[fold]}\\`;
-    res += `\n${indent}${text.slice(fold + 1, end)}`;
+    if (fold === 0) res = `\n${indent}${text.slice(0, end)}`;else {
+      if (mode === FOLD_QUOTED && escapedFolds[fold]) res += `${text[fold]}\\`;
+      res += `\n${indent}${text.slice(fold + 1, end)}`;
+    }
   }
 
   return res;
@@ -5760,7 +5480,9 @@ const getFoldOptions = ({
 
 const containsDocumentMarker = str => /^(%|---|\.\.\.)/m.test(str);
 
-function lineLengthOverLimit(str, limit) {
+function lineLengthOverLimit(str, lineWidth, indentLength) {
+  if (!lineWidth || lineWidth < 0) return false;
+  const limit = lineWidth - indentLength;
   const strLen = str.length;
   if (strLen <= limit) return false;
 
@@ -5903,7 +5625,7 @@ function blockString({
   const indent = ctx.indent || (ctx.forceBlockIndent || containsDocumentMarker(value) ? '  ' : '');
   const indentSize = indent ? '2' : '1'; // root is at -1
 
-  const literal = type === PlainValue.Type.BLOCK_FOLDED ? false : type === PlainValue.Type.BLOCK_LITERAL ? true : !lineLengthOverLimit(value, strOptions.fold.lineWidth - indent.length);
+  const literal = type === PlainValue.Type.BLOCK_FOLDED ? false : type === PlainValue.Type.BLOCK_LITERAL ? true : !lineLengthOverLimit(value, strOptions.fold.lineWidth, indent.length);
   let header = literal ? '|' : '>';
   if (!value) return header + '\n';
   let wsStart = '';
@@ -7137,6 +6859,52 @@ module.exports = baseKeys;
 
 /***/ }),
 
+/***/ 356:
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+/*!
+ * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
+ *
+ * Copyright (c) 2014-2017, Jon Schlinkert.
+ * Released under the MIT License.
+ */
+
+function isObject(o) {
+  return Object.prototype.toString.call(o) === '[object Object]';
+}
+
+function isPlainObject(o) {
+  var ctor,prot;
+
+  if (isObject(o) === false) return false;
+
+  // If has modified constructor
+  ctor = o.constructor;
+  if (ctor === undefined) return true;
+
+  // If has modified prototype
+  prot = ctor.prototype;
+  if (isObject(prot) === false) return false;
+
+  // If constructor does not have an Object-specific method
+  if (prot.hasOwnProperty('isPrototypeOf') === false) {
+    return false;
+  }
+
+  // Most likely a plain Object
+  return true;
+}
+
+exports.isPlainObject = isPlainObject;
+
+
+/***/ }),
+
 /***/ 357:
 /***/ (function(module) {
 
@@ -7178,9 +6946,7 @@ module.exports = baseValues;
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
-function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
-
-var isPlainObject = _interopDefault(__webpack_require__(696));
+var isPlainObject = __webpack_require__(356);
 var universalUserAgent = __webpack_require__(796);
 
 function lowercaseKeys(object) {
@@ -7197,7 +6963,7 @@ function lowercaseKeys(object) {
 function mergeDeep(defaults, options) {
   const result = Object.assign({}, defaults);
   Object.keys(options).forEach(key => {
-    if (isPlainObject(options[key])) {
+    if (isPlainObject.isPlainObject(options[key])) {
       if (!(key in defaults)) Object.assign(result, {
         [key]: options[key]
       });else result[key] = mergeDeep(defaults[key], options[key]);
@@ -7208,6 +6974,16 @@ function mergeDeep(defaults, options) {
     }
   });
   return result;
+}
+
+function removeUndefinedProperties(obj) {
+  for (const key in obj) {
+    if (obj[key] === undefined) {
+      delete obj[key];
+    }
+  }
+
+  return obj;
 }
 
 function merge(defaults, route, options) {
@@ -7224,7 +7000,10 @@ function merge(defaults, route, options) {
   } // lowercase header names before merging with defaults to avoid duplicates
 
 
-  options.headers = lowercaseKeys(options.headers);
+  options.headers = lowercaseKeys(options.headers); // remove properties with undefined values before merging
+
+  removeUndefinedProperties(options);
+  removeUndefinedProperties(options.headers);
   const mergedOptions = mergeDeep(defaults || {}, options); // mediaType.previews arrays are merged, instead of overwritten
 
   if (defaults && defaults.mediaType.previews.length) {
@@ -7446,7 +7225,7 @@ function parse(options) {
   // https://fetch.spec.whatwg.org/#methods
   let method = options.method.toUpperCase(); // replace :varname with {varname} to make it RFC 6570 compatible
 
-  let url = (options.url || "/").replace(/:([a-z]\w+)/g, "{+$1}");
+  let url = (options.url || "/").replace(/:([a-z]\w+)/g, "{$1}");
   let headers = Object.assign({}, options.headers);
   let body;
   let parameters = omit(options, ["method", "baseUrl", "url", "headers", "request", "mediaType"]); // extract variable names from URL to calculate remaining variables later
@@ -7460,9 +7239,9 @@ function parse(options) {
 
   const omittedParameters = Object.keys(options).filter(option => urlVariableNames.includes(option)).concat("baseUrl");
   const remainingParameters = omit(parameters, omittedParameters);
-  const isBinaryRequset = /application\/octet-stream/i.test(headers.accept);
+  const isBinaryRequest = /application\/octet-stream/i.test(headers.accept);
 
-  if (!isBinaryRequset) {
+  if (!isBinaryRequest) {
     if (options.mediaType.format) {
       // e.g. application/vnd.github.v3+json => application/vnd.github.v3.raw
       headers.accept = headers.accept.split(/,/).map(preview => preview.replace(/application\/vnd(\.\w+)(\.v3)?(\.\w+)?(\+json)?$/, `application/vnd$1$2.${options.mediaType.format}`)).join(",");
@@ -7531,7 +7310,7 @@ function withDefaults(oldDefaults, newDefaults) {
   });
 }
 
-const VERSION = "6.0.5";
+const VERSION = "6.0.11";
 
 const userAgent = `octokit-endpoint.js/${VERSION} ${universalUserAgent.getUserAgent()}`; // DEFAULTS has all properties set that EndpointOptions has, except url.
 // So we use RequestParameters and add method as additional required property.
@@ -7854,56 +7633,43 @@ var request = __webpack_require__(753);
 var graphql = __webpack_require__(898);
 var authToken = __webpack_require__(813);
 
-function _defineProperty(obj, key, value) {
-  if (key in obj) {
-    Object.defineProperty(obj, key, {
-      value: value,
-      enumerable: true,
-      configurable: true,
-      writable: true
-    });
-  } else {
-    obj[key] = value;
+function _objectWithoutPropertiesLoose(source, excluded) {
+  if (source == null) return {};
+  var target = {};
+  var sourceKeys = Object.keys(source);
+  var key, i;
+
+  for (i = 0; i < sourceKeys.length; i++) {
+    key = sourceKeys[i];
+    if (excluded.indexOf(key) >= 0) continue;
+    target[key] = source[key];
   }
 
-  return obj;
+  return target;
 }
 
-function ownKeys(object, enumerableOnly) {
-  var keys = Object.keys(object);
+function _objectWithoutProperties(source, excluded) {
+  if (source == null) return {};
+
+  var target = _objectWithoutPropertiesLoose(source, excluded);
+
+  var key, i;
 
   if (Object.getOwnPropertySymbols) {
-    var symbols = Object.getOwnPropertySymbols(object);
-    if (enumerableOnly) symbols = symbols.filter(function (sym) {
-      return Object.getOwnPropertyDescriptor(object, sym).enumerable;
-    });
-    keys.push.apply(keys, symbols);
-  }
+    var sourceSymbolKeys = Object.getOwnPropertySymbols(source);
 
-  return keys;
-}
-
-function _objectSpread2(target) {
-  for (var i = 1; i < arguments.length; i++) {
-    var source = arguments[i] != null ? arguments[i] : {};
-
-    if (i % 2) {
-      ownKeys(Object(source), true).forEach(function (key) {
-        _defineProperty(target, key, source[key]);
-      });
-    } else if (Object.getOwnPropertyDescriptors) {
-      Object.defineProperties(target, Object.getOwnPropertyDescriptors(source));
-    } else {
-      ownKeys(Object(source)).forEach(function (key) {
-        Object.defineProperty(target, key, Object.getOwnPropertyDescriptor(source, key));
-      });
+    for (i = 0; i < sourceSymbolKeys.length; i++) {
+      key = sourceSymbolKeys[i];
+      if (excluded.indexOf(key) >= 0) continue;
+      if (!Object.prototype.propertyIsEnumerable.call(source, key)) continue;
+      target[key] = source[key];
     }
   }
 
   return target;
 }
 
-const VERSION = "3.1.2";
+const VERSION = "3.3.1";
 
 class Octokit {
   constructor(options = {}) {
@@ -7912,6 +7678,7 @@ class Octokit {
       baseUrl: request.request.endpoint.DEFAULTS.baseUrl,
       headers: {},
       request: Object.assign({}, options.request, {
+        // @ts-ignore internal usage only, no need to type
         hook: hook.bind(null, "request")
       }),
       mediaType: {
@@ -7935,9 +7702,7 @@ class Octokit {
     }
 
     this.request = request.request.defaults(requestDefaults);
-    this.graphql = graphql.withCustomRequest(this.request).defaults(_objectSpread2(_objectSpread2({}, requestDefaults), {}, {
-      baseUrl: requestDefaults.baseUrl.replace(/\/api\/v3$/, "/api")
-    }));
+    this.graphql = graphql.withCustomRequest(this.request).defaults(requestDefaults);
     this.log = Object.assign({
       debug: () => {},
       info: () => {},
@@ -7945,7 +7710,7 @@ class Octokit {
       error: console.error.bind(console)
     }, options.log);
     this.hook = hook; // (1) If neither `options.authStrategy` nor `options.auth` are set, the `octokit` instance
-    //     is unauthenticated. The `this.auth()` method is a no-op and no request hook is registred.
+    //     is unauthenticated. The `this.auth()` method is a no-op and no request hook is registered.
     // (2) If only `options.auth` is set, use the default token authentication strategy.
     // (3) If `options.authStrategy` is set then use it and pass in `options.auth`. Always pass own request as many strategies accept a custom request instance.
     // TODO: type `options.auth` based on `options.authStrategy`.
@@ -7964,8 +7729,21 @@ class Octokit {
         this.auth = auth;
       }
     } else {
-      const auth = options.authStrategy(Object.assign({
-        request: this.request
+      const {
+        authStrategy
+      } = options,
+            otherOptions = _objectWithoutProperties(options, ["authStrategy"]);
+
+      const auth = authStrategy(Object.assign({
+        request: this.request,
+        log: this.log,
+        // we pass the current octokit instance as well as its constructor options
+        // to allow for authentication strategies that return a new octokit instance
+        // that shares the same internal state as the current one. The original
+        // requirement for this was the "event-octokit" authentication strategy
+        // of https://github.com/probot/octokit-auth-probot.
+        octokit: this,
+        octokitOptions: otherOptions
       }, options.auth)); // @ts-ignore  ¯\_(ツ)_/¯
 
       hook.wrap("request", auth.hook);
@@ -10091,51 +9869,51 @@ module.exports = Symbol;
 /***/ 510:
 /***/ (function(module) {
 
-module.exports = addHook
+module.exports = addHook;
 
-function addHook (state, kind, name, hook) {
-  var orig = hook
+function addHook(state, kind, name, hook) {
+  var orig = hook;
   if (!state.registry[name]) {
-    state.registry[name] = []
+    state.registry[name] = [];
   }
 
-  if (kind === 'before') {
+  if (kind === "before") {
     hook = function (method, options) {
       return Promise.resolve()
         .then(orig.bind(null, options))
-        .then(method.bind(null, options))
-    }
+        .then(method.bind(null, options));
+    };
   }
 
-  if (kind === 'after') {
+  if (kind === "after") {
     hook = function (method, options) {
-      var result
+      var result;
       return Promise.resolve()
         .then(method.bind(null, options))
         .then(function (result_) {
-          result = result_
-          return orig(result, options)
+          result = result_;
+          return orig(result, options);
         })
         .then(function () {
-          return result
-        })
-    }
+          return result;
+        });
+    };
   }
 
-  if (kind === 'error') {
+  if (kind === "error") {
     hook = function (method, options) {
       return Promise.resolve()
         .then(method.bind(null, options))
         .catch(function (error) {
-          return orig(error, options)
-        })
-    }
+          return orig(error, options);
+        });
+    };
   }
 
   state.registry[name].push({
     hook: hook,
-    orig: orig
-  })
+    orig: orig,
+  });
 }
 
 
@@ -11175,536 +10953,6 @@ module.exports.Collection = Hook.Collection
 
 /***/ }),
 
-/***/ 525:
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-
-var PlainValue = __webpack_require__(513);
-var resolveSeq = __webpack_require__(310);
-var warnings = __webpack_require__(626);
-
-function createMap(schema, obj, ctx) {
-  const map = new resolveSeq.YAMLMap(schema);
-
-  if (obj instanceof Map) {
-    for (const [key, value] of obj) map.items.push(schema.createPair(key, value, ctx));
-  } else if (obj && typeof obj === 'object') {
-    for (const key of Object.keys(obj)) map.items.push(schema.createPair(key, obj[key], ctx));
-  }
-
-  if (typeof schema.sortMapEntries === 'function') {
-    map.items.sort(schema.sortMapEntries);
-  }
-
-  return map;
-}
-
-const map = {
-  createNode: createMap,
-  default: true,
-  nodeClass: resolveSeq.YAMLMap,
-  tag: 'tag:yaml.org,2002:map',
-  resolve: resolveSeq.resolveMap
-};
-
-function createSeq(schema, obj, ctx) {
-  const seq = new resolveSeq.YAMLSeq(schema);
-
-  if (obj && obj[Symbol.iterator]) {
-    for (const it of obj) {
-      const v = schema.createNode(it, ctx.wrapScalars, null, ctx);
-      seq.items.push(v);
-    }
-  }
-
-  return seq;
-}
-
-const seq = {
-  createNode: createSeq,
-  default: true,
-  nodeClass: resolveSeq.YAMLSeq,
-  tag: 'tag:yaml.org,2002:seq',
-  resolve: resolveSeq.resolveSeq
-};
-
-const string = {
-  identify: value => typeof value === 'string',
-  default: true,
-  tag: 'tag:yaml.org,2002:str',
-  resolve: resolveSeq.resolveString,
-
-  stringify(item, ctx, onComment, onChompKeep) {
-    ctx = Object.assign({
-      actualString: true
-    }, ctx);
-    return resolveSeq.stringifyString(item, ctx, onComment, onChompKeep);
-  },
-
-  options: resolveSeq.strOptions
-};
-
-const failsafe = [map, seq, string];
-
-/* global BigInt */
-
-const intIdentify = value => typeof value === 'bigint' || Number.isInteger(value);
-
-const intResolve = (src, part, radix) => resolveSeq.intOptions.asBigInt ? BigInt(src) : parseInt(part, radix);
-
-function intStringify(node, radix, prefix) {
-  const {
-    value
-  } = node;
-  if (intIdentify(value) && value >= 0) return prefix + value.toString(radix);
-  return resolveSeq.stringifyNumber(node);
-}
-
-const nullObj = {
-  identify: value => value == null,
-  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
-  default: true,
-  tag: 'tag:yaml.org,2002:null',
-  test: /^(?:~|[Nn]ull|NULL)?$/,
-  resolve: () => null,
-  options: resolveSeq.nullOptions,
-  stringify: () => resolveSeq.nullOptions.nullStr
-};
-const boolObj = {
-  identify: value => typeof value === 'boolean',
-  default: true,
-  tag: 'tag:yaml.org,2002:bool',
-  test: /^(?:[Tt]rue|TRUE|[Ff]alse|FALSE)$/,
-  resolve: str => str[0] === 't' || str[0] === 'T',
-  options: resolveSeq.boolOptions,
-  stringify: ({
-    value
-  }) => value ? resolveSeq.boolOptions.trueStr : resolveSeq.boolOptions.falseStr
-};
-const octObj = {
-  identify: value => intIdentify(value) && value >= 0,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'OCT',
-  test: /^0o([0-7]+)$/,
-  resolve: (str, oct) => intResolve(str, oct, 8),
-  options: resolveSeq.intOptions,
-  stringify: node => intStringify(node, 8, '0o')
-};
-const intObj = {
-  identify: intIdentify,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  test: /^[-+]?[0-9]+$/,
-  resolve: str => intResolve(str, str, 10),
-  options: resolveSeq.intOptions,
-  stringify: resolveSeq.stringifyNumber
-};
-const hexObj = {
-  identify: value => intIdentify(value) && value >= 0,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'HEX',
-  test: /^0x([0-9a-fA-F]+)$/,
-  resolve: (str, hex) => intResolve(str, hex, 16),
-  options: resolveSeq.intOptions,
-  stringify: node => intStringify(node, 16, '0x')
-};
-const nanObj = {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  test: /^(?:[-+]?\.inf|(\.nan))$/i,
-  resolve: (str, nan) => nan ? NaN : str[0] === '-' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
-  stringify: resolveSeq.stringifyNumber
-};
-const expObj = {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  format: 'EXP',
-  test: /^[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][-+]?[0-9]+$/,
-  resolve: str => parseFloat(str),
-  stringify: ({
-    value
-  }) => Number(value).toExponential()
-};
-const floatObj = {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  test: /^[-+]?(?:\.([0-9]+)|[0-9]+\.([0-9]*))$/,
-
-  resolve(str, frac1, frac2) {
-    const frac = frac1 || frac2;
-    const node = new resolveSeq.Scalar(parseFloat(str));
-    if (frac && frac[frac.length - 1] === '0') node.minFractionDigits = frac.length;
-    return node;
-  },
-
-  stringify: resolveSeq.stringifyNumber
-};
-const core = failsafe.concat([nullObj, boolObj, octObj, intObj, hexObj, nanObj, expObj, floatObj]);
-
-/* global BigInt */
-
-const intIdentify$1 = value => typeof value === 'bigint' || Number.isInteger(value);
-
-const stringifyJSON = ({
-  value
-}) => JSON.stringify(value);
-
-const json = [map, seq, {
-  identify: value => typeof value === 'string',
-  default: true,
-  tag: 'tag:yaml.org,2002:str',
-  resolve: resolveSeq.resolveString,
-  stringify: stringifyJSON
-}, {
-  identify: value => value == null,
-  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
-  default: true,
-  tag: 'tag:yaml.org,2002:null',
-  test: /^null$/,
-  resolve: () => null,
-  stringify: stringifyJSON
-}, {
-  identify: value => typeof value === 'boolean',
-  default: true,
-  tag: 'tag:yaml.org,2002:bool',
-  test: /^true|false$/,
-  resolve: str => str === 'true',
-  stringify: stringifyJSON
-}, {
-  identify: intIdentify$1,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  test: /^-?(?:0|[1-9][0-9]*)$/,
-  resolve: str => resolveSeq.intOptions.asBigInt ? BigInt(str) : parseInt(str, 10),
-  stringify: ({
-    value
-  }) => intIdentify$1(value) ? value.toString() : JSON.stringify(value)
-}, {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  test: /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?$/,
-  resolve: str => parseFloat(str),
-  stringify: stringifyJSON
-}];
-
-json.scalarFallback = str => {
-  throw new SyntaxError(`Unresolved plain scalar ${JSON.stringify(str)}`);
-};
-
-/* global BigInt */
-
-const boolStringify = ({
-  value
-}) => value ? resolveSeq.boolOptions.trueStr : resolveSeq.boolOptions.falseStr;
-
-const intIdentify$2 = value => typeof value === 'bigint' || Number.isInteger(value);
-
-function intResolve$1(sign, src, radix) {
-  let str = src.replace(/_/g, '');
-
-  if (resolveSeq.intOptions.asBigInt) {
-    switch (radix) {
-      case 2:
-        str = `0b${str}`;
-        break;
-
-      case 8:
-        str = `0o${str}`;
-        break;
-
-      case 16:
-        str = `0x${str}`;
-        break;
-    }
-
-    const n = BigInt(str);
-    return sign === '-' ? BigInt(-1) * n : n;
-  }
-
-  const n = parseInt(str, radix);
-  return sign === '-' ? -1 * n : n;
-}
-
-function intStringify$1(node, radix, prefix) {
-  const {
-    value
-  } = node;
-
-  if (intIdentify$2(value)) {
-    const str = value.toString(radix);
-    return value < 0 ? '-' + prefix + str.substr(1) : prefix + str;
-  }
-
-  return resolveSeq.stringifyNumber(node);
-}
-
-const yaml11 = failsafe.concat([{
-  identify: value => value == null,
-  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
-  default: true,
-  tag: 'tag:yaml.org,2002:null',
-  test: /^(?:~|[Nn]ull|NULL)?$/,
-  resolve: () => null,
-  options: resolveSeq.nullOptions,
-  stringify: () => resolveSeq.nullOptions.nullStr
-}, {
-  identify: value => typeof value === 'boolean',
-  default: true,
-  tag: 'tag:yaml.org,2002:bool',
-  test: /^(?:Y|y|[Yy]es|YES|[Tt]rue|TRUE|[Oo]n|ON)$/,
-  resolve: () => true,
-  options: resolveSeq.boolOptions,
-  stringify: boolStringify
-}, {
-  identify: value => typeof value === 'boolean',
-  default: true,
-  tag: 'tag:yaml.org,2002:bool',
-  test: /^(?:N|n|[Nn]o|NO|[Ff]alse|FALSE|[Oo]ff|OFF)$/i,
-  resolve: () => false,
-  options: resolveSeq.boolOptions,
-  stringify: boolStringify
-}, {
-  identify: intIdentify$2,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'BIN',
-  test: /^([-+]?)0b([0-1_]+)$/,
-  resolve: (str, sign, bin) => intResolve$1(sign, bin, 2),
-  stringify: node => intStringify$1(node, 2, '0b')
-}, {
-  identify: intIdentify$2,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'OCT',
-  test: /^([-+]?)0([0-7_]+)$/,
-  resolve: (str, sign, oct) => intResolve$1(sign, oct, 8),
-  stringify: node => intStringify$1(node, 8, '0')
-}, {
-  identify: intIdentify$2,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  test: /^([-+]?)([0-9][0-9_]*)$/,
-  resolve: (str, sign, abs) => intResolve$1(sign, abs, 10),
-  stringify: resolveSeq.stringifyNumber
-}, {
-  identify: intIdentify$2,
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'HEX',
-  test: /^([-+]?)0x([0-9a-fA-F_]+)$/,
-  resolve: (str, sign, hex) => intResolve$1(sign, hex, 16),
-  stringify: node => intStringify$1(node, 16, '0x')
-}, {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  test: /^(?:[-+]?\.inf|(\.nan))$/i,
-  resolve: (str, nan) => nan ? NaN : str[0] === '-' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
-  stringify: resolveSeq.stringifyNumber
-}, {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  format: 'EXP',
-  test: /^[-+]?([0-9][0-9_]*)?(\.[0-9_]*)?[eE][-+]?[0-9]+$/,
-  resolve: str => parseFloat(str.replace(/_/g, '')),
-  stringify: ({
-    value
-  }) => Number(value).toExponential()
-}, {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  test: /^[-+]?(?:[0-9][0-9_]*)?\.([0-9_]*)$/,
-
-  resolve(str, frac) {
-    const node = new resolveSeq.Scalar(parseFloat(str.replace(/_/g, '')));
-
-    if (frac) {
-      const f = frac.replace(/_/g, '');
-      if (f[f.length - 1] === '0') node.minFractionDigits = f.length;
-    }
-
-    return node;
-  },
-
-  stringify: resolveSeq.stringifyNumber
-}], warnings.binary, warnings.omap, warnings.pairs, warnings.set, warnings.intTime, warnings.floatTime, warnings.timestamp);
-
-const schemas = {
-  core,
-  failsafe,
-  json,
-  yaml11
-};
-const tags = {
-  binary: warnings.binary,
-  bool: boolObj,
-  float: floatObj,
-  floatExp: expObj,
-  floatNaN: nanObj,
-  floatTime: warnings.floatTime,
-  int: intObj,
-  intHex: hexObj,
-  intOct: octObj,
-  intTime: warnings.intTime,
-  map,
-  null: nullObj,
-  omap: warnings.omap,
-  pairs: warnings.pairs,
-  seq,
-  set: warnings.set,
-  timestamp: warnings.timestamp
-};
-
-function findTagObject(value, tagName, tags) {
-  if (tagName) {
-    const match = tags.filter(t => t.tag === tagName);
-    const tagObj = match.find(t => !t.format) || match[0];
-    if (!tagObj) throw new Error(`Tag ${tagName} not found`);
-    return tagObj;
-  } // TODO: deprecate/remove class check
-
-
-  return tags.find(t => (t.identify && t.identify(value) || t.class && value instanceof t.class) && !t.format);
-}
-
-function createNode(value, tagName, ctx) {
-  if (value instanceof resolveSeq.Node) return value;
-  const {
-    defaultPrefix,
-    onTagObj,
-    prevObjects,
-    schema,
-    wrapScalars
-  } = ctx;
-  if (tagName && tagName.startsWith('!!')) tagName = defaultPrefix + tagName.slice(2);
-  let tagObj = findTagObject(value, tagName, schema.tags);
-
-  if (!tagObj) {
-    if (typeof value.toJSON === 'function') value = value.toJSON();
-    if (typeof value !== 'object') return wrapScalars ? new resolveSeq.Scalar(value) : value;
-    tagObj = value instanceof Map ? map : value[Symbol.iterator] ? seq : map;
-  }
-
-  if (onTagObj) {
-    onTagObj(tagObj);
-    delete ctx.onTagObj;
-  } // Detect duplicate references to the same object & use Alias nodes for all
-  // after first. The `obj` wrapper allows for circular references to resolve.
-
-
-  const obj = {};
-
-  if (value && typeof value === 'object' && prevObjects) {
-    const prev = prevObjects.get(value);
-
-    if (prev) {
-      const alias = new resolveSeq.Alias(prev); // leaves source dirty; must be cleaned by caller
-
-      ctx.aliasNodes.push(alias); // defined along with prevObjects
-
-      return alias;
-    }
-
-    obj.value = value;
-    prevObjects.set(value, obj);
-  }
-
-  obj.node = tagObj.createNode ? tagObj.createNode(ctx.schema, value, ctx) : wrapScalars ? new resolveSeq.Scalar(value) : value;
-  if (tagName && obj.node instanceof resolveSeq.Node) obj.node.tag = tagName;
-  return obj.node;
-}
-
-function getSchemaTags(schemas, knownTags, customTags, schemaId) {
-  let tags = schemas[schemaId.replace(/\W/g, '')]; // 'yaml-1.1' -> 'yaml11'
-
-  if (!tags) {
-    const keys = Object.keys(schemas).map(key => JSON.stringify(key)).join(', ');
-    throw new Error(`Unknown schema "${schemaId}"; use one of ${keys}`);
-  }
-
-  if (Array.isArray(customTags)) {
-    for (const tag of customTags) tags = tags.concat(tag);
-  } else if (typeof customTags === 'function') {
-    tags = customTags(tags.slice());
-  }
-
-  for (let i = 0; i < tags.length; ++i) {
-    const tag = tags[i];
-
-    if (typeof tag === 'string') {
-      const tagObj = knownTags[tag];
-
-      if (!tagObj) {
-        const keys = Object.keys(knownTags).map(key => JSON.stringify(key)).join(', ');
-        throw new Error(`Unknown custom tag "${tag}"; use one of ${keys}`);
-      }
-
-      tags[i] = tagObj;
-    }
-  }
-
-  return tags;
-}
-
-const sortMapEntriesByKey = (a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-
-class Schema {
-  // TODO: remove in v2
-  // TODO: remove in v2
-  constructor({
-    customTags,
-    merge,
-    schema,
-    sortMapEntries,
-    tags: deprecatedCustomTags
-  }) {
-    this.merge = !!merge;
-    this.name = schema;
-    this.sortMapEntries = sortMapEntries === true ? sortMapEntriesByKey : sortMapEntries || null;
-    if (!customTags && deprecatedCustomTags) warnings.warnOptionDeprecation('tags', 'customTags');
-    this.tags = getSchemaTags(schemas, tags, customTags || deprecatedCustomTags, schema);
-  }
-
-  createNode(value, wrapScalars, tagName, ctx) {
-    const baseCtx = {
-      defaultPrefix: Schema.defaultPrefix,
-      schema: this,
-      wrapScalars
-    };
-    const createCtx = ctx ? Object.assign(ctx, baseCtx) : baseCtx;
-    return createNode(value, tagName, createCtx);
-  }
-
-  createPair(key, value, ctx) {
-    if (!ctx) ctx = {
-      wrapScalars: true
-    };
-    const k = this.createNode(key, ctx.wrapScalars, null, ctx);
-    const v = this.createNode(value, ctx.wrapScalars, null, ctx);
-    return new resolveSeq.Pair(k, v);
-  }
-
-}
-
-PlainValue._defineProperty(Schema, "defaultPrefix", PlainValue.defaultTagPrefix);
-
-PlainValue._defineProperty(Schema, "defaultTags", PlainValue.defaultTags);
-
-exports.Schema = Schema;
-
-
-/***/ }),
-
 /***/ 528:
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -11754,7 +11002,6 @@ module.exports = toInteger;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const url = __webpack_require__(835);
 const http = __webpack_require__(605);
 const https = __webpack_require__(211);
 const pm = __webpack_require__(950);
@@ -11803,7 +11050,7 @@ var MediaTypes;
  * @param serverUrl  The server URL where the request will be sent. For example, https://api.github.com
  */
 function getProxyUrl(serverUrl) {
-    let proxyUrl = pm.getProxyUrl(url.parse(serverUrl));
+    let proxyUrl = pm.getProxyUrl(new URL(serverUrl));
     return proxyUrl ? proxyUrl.href : '';
 }
 exports.getProxyUrl = getProxyUrl;
@@ -11822,6 +11069,15 @@ const HttpResponseRetryCodes = [
 const RetryableHttpVerbs = ['OPTIONS', 'GET', 'DELETE', 'HEAD'];
 const ExponentialBackoffCeiling = 10;
 const ExponentialBackoffTimeSlice = 5;
+class HttpClientError extends Error {
+    constructor(message, statusCode) {
+        super(message);
+        this.name = 'HttpClientError';
+        this.statusCode = statusCode;
+        Object.setPrototypeOf(this, HttpClientError.prototype);
+    }
+}
+exports.HttpClientError = HttpClientError;
 class HttpClientResponse {
     constructor(message) {
         this.message = message;
@@ -11840,7 +11096,7 @@ class HttpClientResponse {
 }
 exports.HttpClientResponse = HttpClientResponse;
 function isHttps(requestUrl) {
-    let parsedUrl = url.parse(requestUrl);
+    let parsedUrl = new URL(requestUrl);
     return parsedUrl.protocol === 'https:';
 }
 exports.isHttps = isHttps;
@@ -11945,7 +11201,7 @@ class HttpClient {
         if (this._disposed) {
             throw new Error('Client has already been disposed.');
         }
-        let parsedUrl = url.parse(requestUrl);
+        let parsedUrl = new URL(requestUrl);
         let info = this._prepareRequest(verb, parsedUrl, headers);
         // Only perform retries on reads since writes may not be idempotent.
         let maxTries = this._allowRetries && RetryableHttpVerbs.indexOf(verb) != -1
@@ -11984,7 +11240,7 @@ class HttpClient {
                     // if there's no location to redirect to, we won't
                     break;
                 }
-                let parsedRedirectUrl = url.parse(redirectUrl);
+                let parsedRedirectUrl = new URL(redirectUrl);
                 if (parsedUrl.protocol == 'https:' &&
                     parsedUrl.protocol != parsedRedirectUrl.protocol &&
                     !this._allowRedirectDowngrade) {
@@ -12100,7 +11356,7 @@ class HttpClient {
      * @param serverUrl  The server URL where the request will be sent. For example, https://api.github.com
      */
     getAgent(serverUrl) {
-        let parsedUrl = url.parse(serverUrl);
+        let parsedUrl = new URL(serverUrl);
         return this._getAgent(parsedUrl);
     }
     _prepareRequest(method, requestUrl, headers) {
@@ -12173,7 +11429,7 @@ class HttpClient {
                 maxSockets: maxSockets,
                 keepAlive: this._keepAlive,
                 proxy: {
-                    proxyAuth: proxyUrl.auth,
+                    proxyAuth: `${proxyUrl.username}:${proxyUrl.password}`,
                     host: proxyUrl.hostname,
                     port: proxyUrl.port
                 }
@@ -12268,12 +11524,8 @@ class HttpClient {
                 else {
                     msg = 'Failed request: (' + statusCode + ')';
                 }
-                let err = new Error(msg);
-                // attach statusCode and body obj (if available) to the error object
-                err['statusCode'] = statusCode;
-                if (response.result) {
-                    err['result'] = response.result;
-                }
+                let err = new HttpClientError(msg, statusCode);
+                err.result = response.result;
                 reject(err);
             }
             else {
@@ -12356,6 +11608,32 @@ function baseTimes(n, iteratee) {
 }
 
 module.exports = baseTimes;
+
+
+/***/ }),
+
+/***/ 562:
+/***/ (function(module) {
+
+/** Used to match a single whitespace character. */
+var reWhitespace = /\s/;
+
+/**
+ * Used by `_.trim` and `_.trimEnd` to get the index of the last non-whitespace
+ * character of `string`.
+ *
+ * @private
+ * @param {string} string The string to inspect.
+ * @returns {number} Returns the index of the last non-whitespace character.
+ */
+function trimmedEndIndex(string) {
+  var index = string.length;
+
+  while (index-- && reWhitespace.test(string.charAt(index))) {}
+  return index;
+}
+
+module.exports = trimmedEndIndex;
 
 
 /***/ }),
@@ -12565,430 +11843,6 @@ module.exports = require("path");
 
 /***/ }),
 
-/***/ 626:
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-
-var PlainValue = __webpack_require__(513);
-var resolveSeq = __webpack_require__(310);
-
-/* global atob, btoa, Buffer */
-const binary = {
-  identify: value => value instanceof Uint8Array,
-  // Buffer inherits from Uint8Array
-  default: false,
-  tag: 'tag:yaml.org,2002:binary',
-
-  /**
-   * Returns a Buffer in node and an Uint8Array in browsers
-   *
-   * To use the resulting buffer as an image, you'll want to do something like:
-   *
-   *   const blob = new Blob([buffer], { type: 'image/jpeg' })
-   *   document.querySelector('#photo').src = URL.createObjectURL(blob)
-   */
-  resolve: (doc, node) => {
-    const src = resolveSeq.resolveString(doc, node);
-
-    if (typeof Buffer === 'function') {
-      return Buffer.from(src, 'base64');
-    } else if (typeof atob === 'function') {
-      // On IE 11, atob() can't handle newlines
-      const str = atob(src.replace(/[\n\r]/g, ''));
-      const buffer = new Uint8Array(str.length);
-
-      for (let i = 0; i < str.length; ++i) buffer[i] = str.charCodeAt(i);
-
-      return buffer;
-    } else {
-      const msg = 'This environment does not support reading binary tags; either Buffer or atob is required';
-      doc.errors.push(new PlainValue.YAMLReferenceError(node, msg));
-      return null;
-    }
-  },
-  options: resolveSeq.binaryOptions,
-  stringify: ({
-    comment,
-    type,
-    value
-  }, ctx, onComment, onChompKeep) => {
-    let src;
-
-    if (typeof Buffer === 'function') {
-      src = value instanceof Buffer ? value.toString('base64') : Buffer.from(value.buffer).toString('base64');
-    } else if (typeof btoa === 'function') {
-      let s = '';
-
-      for (let i = 0; i < value.length; ++i) s += String.fromCharCode(value[i]);
-
-      src = btoa(s);
-    } else {
-      throw new Error('This environment does not support writing binary tags; either Buffer or btoa is required');
-    }
-
-    if (!type) type = resolveSeq.binaryOptions.defaultType;
-
-    if (type === PlainValue.Type.QUOTE_DOUBLE) {
-      value = src;
-    } else {
-      const {
-        lineWidth
-      } = resolveSeq.binaryOptions;
-      const n = Math.ceil(src.length / lineWidth);
-      const lines = new Array(n);
-
-      for (let i = 0, o = 0; i < n; ++i, o += lineWidth) {
-        lines[i] = src.substr(o, lineWidth);
-      }
-
-      value = lines.join(type === PlainValue.Type.BLOCK_LITERAL ? '\n' : ' ');
-    }
-
-    return resolveSeq.stringifyString({
-      comment,
-      type,
-      value
-    }, ctx, onComment, onChompKeep);
-  }
-};
-
-function parsePairs(doc, cst) {
-  const seq = resolveSeq.resolveSeq(doc, cst);
-
-  for (let i = 0; i < seq.items.length; ++i) {
-    let item = seq.items[i];
-    if (item instanceof resolveSeq.Pair) continue;else if (item instanceof resolveSeq.YAMLMap) {
-      if (item.items.length > 1) {
-        const msg = 'Each pair must have its own sequence indicator';
-        throw new PlainValue.YAMLSemanticError(cst, msg);
-      }
-
-      const pair = item.items[0] || new resolveSeq.Pair();
-      if (item.commentBefore) pair.commentBefore = pair.commentBefore ? `${item.commentBefore}\n${pair.commentBefore}` : item.commentBefore;
-      if (item.comment) pair.comment = pair.comment ? `${item.comment}\n${pair.comment}` : item.comment;
-      item = pair;
-    }
-    seq.items[i] = item instanceof resolveSeq.Pair ? item : new resolveSeq.Pair(item);
-  }
-
-  return seq;
-}
-function createPairs(schema, iterable, ctx) {
-  const pairs = new resolveSeq.YAMLSeq(schema);
-  pairs.tag = 'tag:yaml.org,2002:pairs';
-
-  for (const it of iterable) {
-    let key, value;
-
-    if (Array.isArray(it)) {
-      if (it.length === 2) {
-        key = it[0];
-        value = it[1];
-      } else throw new TypeError(`Expected [key, value] tuple: ${it}`);
-    } else if (it && it instanceof Object) {
-      const keys = Object.keys(it);
-
-      if (keys.length === 1) {
-        key = keys[0];
-        value = it[key];
-      } else throw new TypeError(`Expected { key: value } tuple: ${it}`);
-    } else {
-      key = it;
-    }
-
-    const pair = schema.createPair(key, value, ctx);
-    pairs.items.push(pair);
-  }
-
-  return pairs;
-}
-const pairs = {
-  default: false,
-  tag: 'tag:yaml.org,2002:pairs',
-  resolve: parsePairs,
-  createNode: createPairs
-};
-
-class YAMLOMap extends resolveSeq.YAMLSeq {
-  constructor() {
-    super();
-
-    PlainValue._defineProperty(this, "add", resolveSeq.YAMLMap.prototype.add.bind(this));
-
-    PlainValue._defineProperty(this, "delete", resolveSeq.YAMLMap.prototype.delete.bind(this));
-
-    PlainValue._defineProperty(this, "get", resolveSeq.YAMLMap.prototype.get.bind(this));
-
-    PlainValue._defineProperty(this, "has", resolveSeq.YAMLMap.prototype.has.bind(this));
-
-    PlainValue._defineProperty(this, "set", resolveSeq.YAMLMap.prototype.set.bind(this));
-
-    this.tag = YAMLOMap.tag;
-  }
-
-  toJSON(_, ctx) {
-    const map = new Map();
-    if (ctx && ctx.onCreate) ctx.onCreate(map);
-
-    for (const pair of this.items) {
-      let key, value;
-
-      if (pair instanceof resolveSeq.Pair) {
-        key = resolveSeq.toJSON(pair.key, '', ctx);
-        value = resolveSeq.toJSON(pair.value, key, ctx);
-      } else {
-        key = resolveSeq.toJSON(pair, '', ctx);
-      }
-
-      if (map.has(key)) throw new Error('Ordered maps must not include duplicate keys');
-      map.set(key, value);
-    }
-
-    return map;
-  }
-
-}
-
-PlainValue._defineProperty(YAMLOMap, "tag", 'tag:yaml.org,2002:omap');
-
-function parseOMap(doc, cst) {
-  const pairs = parsePairs(doc, cst);
-  const seenKeys = [];
-
-  for (const {
-    key
-  } of pairs.items) {
-    if (key instanceof resolveSeq.Scalar) {
-      if (seenKeys.includes(key.value)) {
-        const msg = 'Ordered maps must not include duplicate keys';
-        throw new PlainValue.YAMLSemanticError(cst, msg);
-      } else {
-        seenKeys.push(key.value);
-      }
-    }
-  }
-
-  return Object.assign(new YAMLOMap(), pairs);
-}
-
-function createOMap(schema, iterable, ctx) {
-  const pairs = createPairs(schema, iterable, ctx);
-  const omap = new YAMLOMap();
-  omap.items = pairs.items;
-  return omap;
-}
-
-const omap = {
-  identify: value => value instanceof Map,
-  nodeClass: YAMLOMap,
-  default: false,
-  tag: 'tag:yaml.org,2002:omap',
-  resolve: parseOMap,
-  createNode: createOMap
-};
-
-class YAMLSet extends resolveSeq.YAMLMap {
-  constructor() {
-    super();
-    this.tag = YAMLSet.tag;
-  }
-
-  add(key) {
-    const pair = key instanceof resolveSeq.Pair ? key : new resolveSeq.Pair(key);
-    const prev = resolveSeq.findPair(this.items, pair.key);
-    if (!prev) this.items.push(pair);
-  }
-
-  get(key, keepPair) {
-    const pair = resolveSeq.findPair(this.items, key);
-    return !keepPair && pair instanceof resolveSeq.Pair ? pair.key instanceof resolveSeq.Scalar ? pair.key.value : pair.key : pair;
-  }
-
-  set(key, value) {
-    if (typeof value !== 'boolean') throw new Error(`Expected boolean value for set(key, value) in a YAML set, not ${typeof value}`);
-    const prev = resolveSeq.findPair(this.items, key);
-
-    if (prev && !value) {
-      this.items.splice(this.items.indexOf(prev), 1);
-    } else if (!prev && value) {
-      this.items.push(new resolveSeq.Pair(key));
-    }
-  }
-
-  toJSON(_, ctx) {
-    return super.toJSON(_, ctx, Set);
-  }
-
-  toString(ctx, onComment, onChompKeep) {
-    if (!ctx) return JSON.stringify(this);
-    if (this.hasAllNullValues()) return super.toString(ctx, onComment, onChompKeep);else throw new Error('Set items must all have null values');
-  }
-
-}
-
-PlainValue._defineProperty(YAMLSet, "tag", 'tag:yaml.org,2002:set');
-
-function parseSet(doc, cst) {
-  const map = resolveSeq.resolveMap(doc, cst);
-  if (!map.hasAllNullValues()) throw new PlainValue.YAMLSemanticError(cst, 'Set items must all have null values');
-  return Object.assign(new YAMLSet(), map);
-}
-
-function createSet(schema, iterable, ctx) {
-  const set = new YAMLSet();
-
-  for (const value of iterable) set.items.push(schema.createPair(value, null, ctx));
-
-  return set;
-}
-
-const set = {
-  identify: value => value instanceof Set,
-  nodeClass: YAMLSet,
-  default: false,
-  tag: 'tag:yaml.org,2002:set',
-  resolve: parseSet,
-  createNode: createSet
-};
-
-const parseSexagesimal = (sign, parts) => {
-  const n = parts.split(':').reduce((n, p) => n * 60 + Number(p), 0);
-  return sign === '-' ? -n : n;
-}; // hhhh:mm:ss.sss
-
-
-const stringifySexagesimal = ({
-  value
-}) => {
-  if (isNaN(value) || !isFinite(value)) return resolveSeq.stringifyNumber(value);
-  let sign = '';
-
-  if (value < 0) {
-    sign = '-';
-    value = Math.abs(value);
-  }
-
-  const parts = [value % 60]; // seconds, including ms
-
-  if (value < 60) {
-    parts.unshift(0); // at least one : is required
-  } else {
-    value = Math.round((value - parts[0]) / 60);
-    parts.unshift(value % 60); // minutes
-
-    if (value >= 60) {
-      value = Math.round((value - parts[0]) / 60);
-      parts.unshift(value); // hours
-    }
-  }
-
-  return sign + parts.map(n => n < 10 ? '0' + String(n) : String(n)).join(':').replace(/000000\d*$/, '') // % 60 may introduce error
-  ;
-};
-
-const intTime = {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:int',
-  format: 'TIME',
-  test: /^([-+]?)([0-9][0-9_]*(?::[0-5]?[0-9])+)$/,
-  resolve: (str, sign, parts) => parseSexagesimal(sign, parts.replace(/_/g, '')),
-  stringify: stringifySexagesimal
-};
-const floatTime = {
-  identify: value => typeof value === 'number',
-  default: true,
-  tag: 'tag:yaml.org,2002:float',
-  format: 'TIME',
-  test: /^([-+]?)([0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*)$/,
-  resolve: (str, sign, parts) => parseSexagesimal(sign, parts.replace(/_/g, '')),
-  stringify: stringifySexagesimal
-};
-const timestamp = {
-  identify: value => value instanceof Date,
-  default: true,
-  tag: 'tag:yaml.org,2002:timestamp',
-  // If the time zone is omitted, the timestamp is assumed to be specified in UTC. The time part
-  // may be omitted altogether, resulting in a date format. In such a case, the time part is
-  // assumed to be 00:00:00Z (start of day, UTC).
-  test: RegExp('^(?:' + '([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})' + // YYYY-Mm-Dd
-  '(?:(?:t|T|[ \\t]+)' + // t | T | whitespace
-  '([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}(\\.[0-9]+)?)' + // Hh:Mm:Ss(.ss)?
-  '(?:[ \\t]*(Z|[-+][012]?[0-9](?::[0-9]{2})?))?' + // Z | +5 | -03:30
-  ')?' + ')$'),
-  resolve: (str, year, month, day, hour, minute, second, millisec, tz) => {
-    if (millisec) millisec = (millisec + '00').substr(1, 3);
-    let date = Date.UTC(year, month - 1, day, hour || 0, minute || 0, second || 0, millisec || 0);
-
-    if (tz && tz !== 'Z') {
-      let d = parseSexagesimal(tz[0], tz.slice(1));
-      if (Math.abs(d) < 30) d *= 60;
-      date -= 60000 * d;
-    }
-
-    return new Date(date);
-  },
-  stringify: ({
-    value
-  }) => value.toISOString().replace(/((T00:00)?:00)?\.000Z$/, '')
-};
-
-/* global console, process, YAML_SILENCE_DEPRECATION_WARNINGS, YAML_SILENCE_WARNINGS */
-function shouldWarn(deprecation) {
-  const env = typeof process !== 'undefined' && process.env || {};
-
-  if (deprecation) {
-    if (typeof YAML_SILENCE_DEPRECATION_WARNINGS !== 'undefined') return !YAML_SILENCE_DEPRECATION_WARNINGS;
-    return !env.YAML_SILENCE_DEPRECATION_WARNINGS;
-  }
-
-  if (typeof YAML_SILENCE_WARNINGS !== 'undefined') return !YAML_SILENCE_WARNINGS;
-  return !env.YAML_SILENCE_WARNINGS;
-}
-
-function warn(warning, type) {
-  if (shouldWarn(false)) {
-    const emit = typeof process !== 'undefined' && process.emitWarning; // This will throw in Jest if `warning` is an Error instance due to
-    // https://github.com/facebook/jest/issues/2549
-
-    if (emit) emit(warning, type);else {
-      // eslint-disable-next-line no-console
-      console.warn(type ? `${type}: ${warning}` : warning);
-    }
-  }
-}
-function warnFileDeprecation(filename) {
-  if (shouldWarn(true)) {
-    const path = filename.replace(/.*yaml[/\\]/i, '').replace(/\.js$/, '').replace(/\\/g, '/');
-    warn(`The endpoint 'yaml/${path}' will be removed in a future release.`, 'DeprecationWarning');
-  }
-}
-const warned = {};
-function warnOptionDeprecation(name, alternative) {
-  if (!warned[name] && shouldWarn(true)) {
-    warned[name] = true;
-    let msg = `The option '${name}' will be removed in a future release`;
-    msg += alternative ? `, use '${alternative}' instead.` : '.';
-    warn(msg, 'DeprecationWarning');
-  }
-}
-
-exports.binary = binary;
-exports.floatTime = floatTime;
-exports.intTime = intTime;
-exports.omap = omap;
-exports.pairs = pairs;
-exports.set = set;
-exports.timestamp = timestamp;
-exports.warn = warn;
-exports.warnFileDeprecation = warnFileDeprecation;
-exports.warnOptionDeprecation = warnOptionDeprecation;
-
-
-/***/ }),
-
 /***/ 631:
 /***/ (function(module) {
 
@@ -13154,50 +12008,6 @@ exports.Deprecation = Deprecation;
 
 /***/ }),
 
-/***/ 696:
-/***/ (function(module) {
-
-"use strict";
-
-
-/*!
- * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
- *
- * Copyright (c) 2014-2017, Jon Schlinkert.
- * Released under the MIT License.
- */
-
-function isObject(o) {
-  return Object.prototype.toString.call(o) === '[object Object]';
-}
-
-function isPlainObject(o) {
-  var ctor,prot;
-
-  if (isObject(o) === false) return false;
-
-  // If has modified constructor
-  ctor = o.constructor;
-  if (ctor === undefined) return true;
-
-  // If has modified prototype
-  prot = ctor.prototype;
-  if (isObject(prot) === false) return false;
-
-  // If constructor does not have an Object-specific method
-  if (prot.hasOwnProperty('isPrototypeOf') === false) {
-    return false;
-  }
-
-  // Most likely a plain Object
-  return true;
-}
-
-module.exports = isPlainObject;
-
-
-/***/ }),
-
 /***/ 727:
 /***/ (function(module) {
 
@@ -13233,6 +12043,539 @@ module.exports = require("fs");
 
 /***/ }),
 
+/***/ 751:
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+var PlainValue = __webpack_require__(513);
+var resolveSeq = __webpack_require__(329);
+var warnings = __webpack_require__(287);
+
+function createMap(schema, obj, ctx) {
+  const map = new resolveSeq.YAMLMap(schema);
+
+  if (obj instanceof Map) {
+    for (const [key, value] of obj) map.items.push(schema.createPair(key, value, ctx));
+  } else if (obj && typeof obj === 'object') {
+    for (const key of Object.keys(obj)) map.items.push(schema.createPair(key, obj[key], ctx));
+  }
+
+  if (typeof schema.sortMapEntries === 'function') {
+    map.items.sort(schema.sortMapEntries);
+  }
+
+  return map;
+}
+
+const map = {
+  createNode: createMap,
+  default: true,
+  nodeClass: resolveSeq.YAMLMap,
+  tag: 'tag:yaml.org,2002:map',
+  resolve: resolveSeq.resolveMap
+};
+
+function createSeq(schema, obj, ctx) {
+  const seq = new resolveSeq.YAMLSeq(schema);
+
+  if (obj && obj[Symbol.iterator]) {
+    for (const it of obj) {
+      const v = schema.createNode(it, ctx.wrapScalars, null, ctx);
+      seq.items.push(v);
+    }
+  }
+
+  return seq;
+}
+
+const seq = {
+  createNode: createSeq,
+  default: true,
+  nodeClass: resolveSeq.YAMLSeq,
+  tag: 'tag:yaml.org,2002:seq',
+  resolve: resolveSeq.resolveSeq
+};
+
+const string = {
+  identify: value => typeof value === 'string',
+  default: true,
+  tag: 'tag:yaml.org,2002:str',
+  resolve: resolveSeq.resolveString,
+
+  stringify(item, ctx, onComment, onChompKeep) {
+    ctx = Object.assign({
+      actualString: true
+    }, ctx);
+    return resolveSeq.stringifyString(item, ctx, onComment, onChompKeep);
+  },
+
+  options: resolveSeq.strOptions
+};
+
+const failsafe = [map, seq, string];
+
+/* global BigInt */
+
+const intIdentify$2 = value => typeof value === 'bigint' || Number.isInteger(value);
+
+const intResolve$1 = (src, part, radix) => resolveSeq.intOptions.asBigInt ? BigInt(src) : parseInt(part, radix);
+
+function intStringify$1(node, radix, prefix) {
+  const {
+    value
+  } = node;
+  if (intIdentify$2(value) && value >= 0) return prefix + value.toString(radix);
+  return resolveSeq.stringifyNumber(node);
+}
+
+const nullObj = {
+  identify: value => value == null,
+  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
+  default: true,
+  tag: 'tag:yaml.org,2002:null',
+  test: /^(?:~|[Nn]ull|NULL)?$/,
+  resolve: () => null,
+  options: resolveSeq.nullOptions,
+  stringify: () => resolveSeq.nullOptions.nullStr
+};
+const boolObj = {
+  identify: value => typeof value === 'boolean',
+  default: true,
+  tag: 'tag:yaml.org,2002:bool',
+  test: /^(?:[Tt]rue|TRUE|[Ff]alse|FALSE)$/,
+  resolve: str => str[0] === 't' || str[0] === 'T',
+  options: resolveSeq.boolOptions,
+  stringify: ({
+    value
+  }) => value ? resolveSeq.boolOptions.trueStr : resolveSeq.boolOptions.falseStr
+};
+const octObj = {
+  identify: value => intIdentify$2(value) && value >= 0,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'OCT',
+  test: /^0o([0-7]+)$/,
+  resolve: (str, oct) => intResolve$1(str, oct, 8),
+  options: resolveSeq.intOptions,
+  stringify: node => intStringify$1(node, 8, '0o')
+};
+const intObj = {
+  identify: intIdentify$2,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  test: /^[-+]?[0-9]+$/,
+  resolve: str => intResolve$1(str, str, 10),
+  options: resolveSeq.intOptions,
+  stringify: resolveSeq.stringifyNumber
+};
+const hexObj = {
+  identify: value => intIdentify$2(value) && value >= 0,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'HEX',
+  test: /^0x([0-9a-fA-F]+)$/,
+  resolve: (str, hex) => intResolve$1(str, hex, 16),
+  options: resolveSeq.intOptions,
+  stringify: node => intStringify$1(node, 16, '0x')
+};
+const nanObj = {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  test: /^(?:[-+]?\.inf|(\.nan))$/i,
+  resolve: (str, nan) => nan ? NaN : str[0] === '-' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+  stringify: resolveSeq.stringifyNumber
+};
+const expObj = {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  format: 'EXP',
+  test: /^[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][-+]?[0-9]+$/,
+  resolve: str => parseFloat(str),
+  stringify: ({
+    value
+  }) => Number(value).toExponential()
+};
+const floatObj = {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  test: /^[-+]?(?:\.([0-9]+)|[0-9]+\.([0-9]*))$/,
+
+  resolve(str, frac1, frac2) {
+    const frac = frac1 || frac2;
+    const node = new resolveSeq.Scalar(parseFloat(str));
+    if (frac && frac[frac.length - 1] === '0') node.minFractionDigits = frac.length;
+    return node;
+  },
+
+  stringify: resolveSeq.stringifyNumber
+};
+const core = failsafe.concat([nullObj, boolObj, octObj, intObj, hexObj, nanObj, expObj, floatObj]);
+
+/* global BigInt */
+
+const intIdentify$1 = value => typeof value === 'bigint' || Number.isInteger(value);
+
+const stringifyJSON = ({
+  value
+}) => JSON.stringify(value);
+
+const json = [map, seq, {
+  identify: value => typeof value === 'string',
+  default: true,
+  tag: 'tag:yaml.org,2002:str',
+  resolve: resolveSeq.resolveString,
+  stringify: stringifyJSON
+}, {
+  identify: value => value == null,
+  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
+  default: true,
+  tag: 'tag:yaml.org,2002:null',
+  test: /^null$/,
+  resolve: () => null,
+  stringify: stringifyJSON
+}, {
+  identify: value => typeof value === 'boolean',
+  default: true,
+  tag: 'tag:yaml.org,2002:bool',
+  test: /^true|false$/,
+  resolve: str => str === 'true',
+  stringify: stringifyJSON
+}, {
+  identify: intIdentify$1,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  test: /^-?(?:0|[1-9][0-9]*)$/,
+  resolve: str => resolveSeq.intOptions.asBigInt ? BigInt(str) : parseInt(str, 10),
+  stringify: ({
+    value
+  }) => intIdentify$1(value) ? value.toString() : JSON.stringify(value)
+}, {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  test: /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?$/,
+  resolve: str => parseFloat(str),
+  stringify: stringifyJSON
+}];
+
+json.scalarFallback = str => {
+  throw new SyntaxError(`Unresolved plain scalar ${JSON.stringify(str)}`);
+};
+
+/* global BigInt */
+
+const boolStringify = ({
+  value
+}) => value ? resolveSeq.boolOptions.trueStr : resolveSeq.boolOptions.falseStr;
+
+const intIdentify = value => typeof value === 'bigint' || Number.isInteger(value);
+
+function intResolve(sign, src, radix) {
+  let str = src.replace(/_/g, '');
+
+  if (resolveSeq.intOptions.asBigInt) {
+    switch (radix) {
+      case 2:
+        str = `0b${str}`;
+        break;
+
+      case 8:
+        str = `0o${str}`;
+        break;
+
+      case 16:
+        str = `0x${str}`;
+        break;
+    }
+
+    const n = BigInt(str);
+    return sign === '-' ? BigInt(-1) * n : n;
+  }
+
+  const n = parseInt(str, radix);
+  return sign === '-' ? -1 * n : n;
+}
+
+function intStringify(node, radix, prefix) {
+  const {
+    value
+  } = node;
+
+  if (intIdentify(value)) {
+    const str = value.toString(radix);
+    return value < 0 ? '-' + prefix + str.substr(1) : prefix + str;
+  }
+
+  return resolveSeq.stringifyNumber(node);
+}
+
+const yaml11 = failsafe.concat([{
+  identify: value => value == null,
+  createNode: (schema, value, ctx) => ctx.wrapScalars ? new resolveSeq.Scalar(null) : null,
+  default: true,
+  tag: 'tag:yaml.org,2002:null',
+  test: /^(?:~|[Nn]ull|NULL)?$/,
+  resolve: () => null,
+  options: resolveSeq.nullOptions,
+  stringify: () => resolveSeq.nullOptions.nullStr
+}, {
+  identify: value => typeof value === 'boolean',
+  default: true,
+  tag: 'tag:yaml.org,2002:bool',
+  test: /^(?:Y|y|[Yy]es|YES|[Tt]rue|TRUE|[Oo]n|ON)$/,
+  resolve: () => true,
+  options: resolveSeq.boolOptions,
+  stringify: boolStringify
+}, {
+  identify: value => typeof value === 'boolean',
+  default: true,
+  tag: 'tag:yaml.org,2002:bool',
+  test: /^(?:N|n|[Nn]o|NO|[Ff]alse|FALSE|[Oo]ff|OFF)$/i,
+  resolve: () => false,
+  options: resolveSeq.boolOptions,
+  stringify: boolStringify
+}, {
+  identify: intIdentify,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'BIN',
+  test: /^([-+]?)0b([0-1_]+)$/,
+  resolve: (str, sign, bin) => intResolve(sign, bin, 2),
+  stringify: node => intStringify(node, 2, '0b')
+}, {
+  identify: intIdentify,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'OCT',
+  test: /^([-+]?)0([0-7_]+)$/,
+  resolve: (str, sign, oct) => intResolve(sign, oct, 8),
+  stringify: node => intStringify(node, 8, '0')
+}, {
+  identify: intIdentify,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  test: /^([-+]?)([0-9][0-9_]*)$/,
+  resolve: (str, sign, abs) => intResolve(sign, abs, 10),
+  stringify: resolveSeq.stringifyNumber
+}, {
+  identify: intIdentify,
+  default: true,
+  tag: 'tag:yaml.org,2002:int',
+  format: 'HEX',
+  test: /^([-+]?)0x([0-9a-fA-F_]+)$/,
+  resolve: (str, sign, hex) => intResolve(sign, hex, 16),
+  stringify: node => intStringify(node, 16, '0x')
+}, {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  test: /^(?:[-+]?\.inf|(\.nan))$/i,
+  resolve: (str, nan) => nan ? NaN : str[0] === '-' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+  stringify: resolveSeq.stringifyNumber
+}, {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  format: 'EXP',
+  test: /^[-+]?([0-9][0-9_]*)?(\.[0-9_]*)?[eE][-+]?[0-9]+$/,
+  resolve: str => parseFloat(str.replace(/_/g, '')),
+  stringify: ({
+    value
+  }) => Number(value).toExponential()
+}, {
+  identify: value => typeof value === 'number',
+  default: true,
+  tag: 'tag:yaml.org,2002:float',
+  test: /^[-+]?(?:[0-9][0-9_]*)?\.([0-9_]*)$/,
+
+  resolve(str, frac) {
+    const node = new resolveSeq.Scalar(parseFloat(str.replace(/_/g, '')));
+
+    if (frac) {
+      const f = frac.replace(/_/g, '');
+      if (f[f.length - 1] === '0') node.minFractionDigits = f.length;
+    }
+
+    return node;
+  },
+
+  stringify: resolveSeq.stringifyNumber
+}], warnings.binary, warnings.omap, warnings.pairs, warnings.set, warnings.intTime, warnings.floatTime, warnings.timestamp);
+
+const schemas = {
+  core,
+  failsafe,
+  json,
+  yaml11
+};
+const tags = {
+  binary: warnings.binary,
+  bool: boolObj,
+  float: floatObj,
+  floatExp: expObj,
+  floatNaN: nanObj,
+  floatTime: warnings.floatTime,
+  int: intObj,
+  intHex: hexObj,
+  intOct: octObj,
+  intTime: warnings.intTime,
+  map,
+  null: nullObj,
+  omap: warnings.omap,
+  pairs: warnings.pairs,
+  seq,
+  set: warnings.set,
+  timestamp: warnings.timestamp
+};
+
+function findTagObject(value, tagName, tags) {
+  if (tagName) {
+    const match = tags.filter(t => t.tag === tagName);
+    const tagObj = match.find(t => !t.format) || match[0];
+    if (!tagObj) throw new Error(`Tag ${tagName} not found`);
+    return tagObj;
+  } // TODO: deprecate/remove class check
+
+
+  return tags.find(t => (t.identify && t.identify(value) || t.class && value instanceof t.class) && !t.format);
+}
+
+function createNode(value, tagName, ctx) {
+  if (value instanceof resolveSeq.Node) return value;
+  const {
+    defaultPrefix,
+    onTagObj,
+    prevObjects,
+    schema,
+    wrapScalars
+  } = ctx;
+  if (tagName && tagName.startsWith('!!')) tagName = defaultPrefix + tagName.slice(2);
+  let tagObj = findTagObject(value, tagName, schema.tags);
+
+  if (!tagObj) {
+    if (typeof value.toJSON === 'function') value = value.toJSON();
+    if (!value || typeof value !== 'object') return wrapScalars ? new resolveSeq.Scalar(value) : value;
+    tagObj = value instanceof Map ? map : value[Symbol.iterator] ? seq : map;
+  }
+
+  if (onTagObj) {
+    onTagObj(tagObj);
+    delete ctx.onTagObj;
+  } // Detect duplicate references to the same object & use Alias nodes for all
+  // after first. The `obj` wrapper allows for circular references to resolve.
+
+
+  const obj = {
+    value: undefined,
+    node: undefined
+  };
+
+  if (value && typeof value === 'object' && prevObjects) {
+    const prev = prevObjects.get(value);
+
+    if (prev) {
+      const alias = new resolveSeq.Alias(prev); // leaves source dirty; must be cleaned by caller
+
+      ctx.aliasNodes.push(alias); // defined along with prevObjects
+
+      return alias;
+    }
+
+    obj.value = value;
+    prevObjects.set(value, obj);
+  }
+
+  obj.node = tagObj.createNode ? tagObj.createNode(ctx.schema, value, ctx) : wrapScalars ? new resolveSeq.Scalar(value) : value;
+  if (tagName && obj.node instanceof resolveSeq.Node) obj.node.tag = tagName;
+  return obj.node;
+}
+
+function getSchemaTags(schemas, knownTags, customTags, schemaId) {
+  let tags = schemas[schemaId.replace(/\W/g, '')]; // 'yaml-1.1' -> 'yaml11'
+
+  if (!tags) {
+    const keys = Object.keys(schemas).map(key => JSON.stringify(key)).join(', ');
+    throw new Error(`Unknown schema "${schemaId}"; use one of ${keys}`);
+  }
+
+  if (Array.isArray(customTags)) {
+    for (const tag of customTags) tags = tags.concat(tag);
+  } else if (typeof customTags === 'function') {
+    tags = customTags(tags.slice());
+  }
+
+  for (let i = 0; i < tags.length; ++i) {
+    const tag = tags[i];
+
+    if (typeof tag === 'string') {
+      const tagObj = knownTags[tag];
+
+      if (!tagObj) {
+        const keys = Object.keys(knownTags).map(key => JSON.stringify(key)).join(', ');
+        throw new Error(`Unknown custom tag "${tag}"; use one of ${keys}`);
+      }
+
+      tags[i] = tagObj;
+    }
+  }
+
+  return tags;
+}
+
+const sortMapEntriesByKey = (a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+
+class Schema {
+  // TODO: remove in v2
+  // TODO: remove in v2
+  constructor({
+    customTags,
+    merge,
+    schema,
+    sortMapEntries,
+    tags: deprecatedCustomTags
+  }) {
+    this.merge = !!merge;
+    this.name = schema;
+    this.sortMapEntries = sortMapEntries === true ? sortMapEntriesByKey : sortMapEntries || null;
+    if (!customTags && deprecatedCustomTags) warnings.warnOptionDeprecation('tags', 'customTags');
+    this.tags = getSchemaTags(schemas, tags, customTags || deprecatedCustomTags, schema);
+  }
+
+  createNode(value, wrapScalars, tagName, ctx) {
+    const baseCtx = {
+      defaultPrefix: Schema.defaultPrefix,
+      schema: this,
+      wrapScalars
+    };
+    const createCtx = ctx ? Object.assign(ctx, baseCtx) : baseCtx;
+    return createNode(value, tagName, createCtx);
+  }
+
+  createPair(key, value, ctx) {
+    if (!ctx) ctx = {
+      wrapScalars: true
+    };
+    const k = this.createNode(key, ctx.wrapScalars, null, ctx);
+    const v = this.createNode(value, ctx.wrapScalars, null, ctx);
+    return new resolveSeq.Pair(k, v);
+  }
+
+}
+
+PlainValue._defineProperty(Schema, "defaultPrefix", PlainValue.defaultTagPrefix);
+
+PlainValue._defineProperty(Schema, "defaultTags", PlainValue.defaultTags);
+
+exports.Schema = Schema;
+
+
+/***/ }),
+
 /***/ 753:
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
@@ -13245,18 +12588,18 @@ function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'defau
 
 var endpoint = __webpack_require__(385);
 var universalUserAgent = __webpack_require__(796);
-var isPlainObject = _interopDefault(__webpack_require__(696));
+var isPlainObject = __webpack_require__(356);
 var nodeFetch = _interopDefault(__webpack_require__(454));
 var requestError = __webpack_require__(463);
 
-const VERSION = "5.4.7";
+const VERSION = "5.4.14";
 
 function getBufferResponse(response) {
   return response.arrayBuffer();
 }
 
 function fetchWrapper(requestOptions) {
-  if (isPlainObject(requestOptions.body) || Array.isArray(requestOptions.body)) {
+  if (isPlainObject.isPlainObject(requestOptions.body) || Array.isArray(requestOptions.body)) {
     requestOptions.body = JSON.stringify(requestOptions.body);
   }
 
@@ -13409,6 +12752,32 @@ module.exports = nativeKeys;
 
 /***/ }),
 
+/***/ 782:
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+var trimmedEndIndex = __webpack_require__(562);
+
+/** Used to match leading whitespace. */
+var reTrimStart = /^\s+/;
+
+/**
+ * The base implementation of `_.trim`.
+ *
+ * @private
+ * @param {string} string The string to trim.
+ * @returns {string} Returns the trimmed string.
+ */
+function baseTrim(string) {
+  return string
+    ? string.slice(0, trimmedEndIndex(string) + 1).replace(reTrimStart, '')
+    : string;
+}
+
+module.exports = baseTrim;
+
+
+/***/ }),
+
 /***/ 783:
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -13485,16 +12854,26 @@ async function fetch_config() {
   const context = get_context();
   const octokit = get_octokit();
   const config_path = get_config_path();
+  const config_gist_id = get_config_gist_id();
+  let configContent;
 
-  const { data: response_body } = await octokit.repos.getContent({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    path: config_path,
-    ref: context.ref,
-  });
+  if (config_gist_id) {
+    const { data: gistResponse } = await octokit.gists.get({
+      gist_id: config_gist_id
+    });
+    const fileName = Object.keys(gistResponse.files);
+    configContent = data.files[fileName].content;
+  } else {
+    const { data: response_body } = await octokit.repos.getContent({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      path: config_path,
+      ref: context.ref,
+    });
+    configContent = Buffer.from(response_body.content, response_body.encoding).toString();
+  }
 
-  const content = Buffer.from(response_body.content, response_body.encoding).toString();
-  return yaml.parse(content);
+  return yaml.parse(configContent);
 }
 
 async function fetch_changed_files() {
@@ -13555,6 +12934,7 @@ async function assign_reviewers(reviewers) {
 let context_cache;
 let token_cache;
 let config_path_cache;
+let config_gist_id_cache;
 let octokit_cache;
 
 function get_context() {
@@ -13567,6 +12947,10 @@ function get_token() {
 
 function get_config_path() {
   return config_path_cache || (config_path_cache = core.getInput('config'));
+}
+
+function get_config_gist_id() {
+  return config_gist_id_cache || (config_gist_id_cache = core.getInput('config_gist_id'));
 }
 
 function get_octokit() {
@@ -13602,12 +12986,12 @@ module.exports = {
 "use strict";
 
 
-var PlainValue = __webpack_require__(513);
 var parseCst = __webpack_require__(63);
-__webpack_require__(310);
-var Document$1 = __webpack_require__(192);
-var Schema = __webpack_require__(525);
-var warnings = __webpack_require__(626);
+var Document$1 = __webpack_require__(808);
+var Schema = __webpack_require__(751);
+var PlainValue = __webpack_require__(513);
+var warnings = __webpack_require__(287);
+__webpack_require__(329);
 
 function createNode(value, wrapScalars = true, tag) {
   if (tag === undefined && typeof wrapScalars === 'string') {
@@ -13716,6 +13100,771 @@ exports.getUserAgent = getUserAgent;
 
 /***/ }),
 
+/***/ 808:
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+var PlainValue = __webpack_require__(513);
+var resolveSeq = __webpack_require__(329);
+var Schema = __webpack_require__(751);
+
+const defaultOptions = {
+  anchorPrefix: 'a',
+  customTags: null,
+  indent: 2,
+  indentSeq: true,
+  keepCstNodes: false,
+  keepNodeTypes: true,
+  keepBlobsInJSON: true,
+  mapAsMap: false,
+  maxAliasCount: 100,
+  prettyErrors: false,
+  // TODO Set true in v2
+  simpleKeys: false,
+  version: '1.2'
+};
+const scalarOptions = {
+  get binary() {
+    return resolveSeq.binaryOptions;
+  },
+
+  set binary(opt) {
+    Object.assign(resolveSeq.binaryOptions, opt);
+  },
+
+  get bool() {
+    return resolveSeq.boolOptions;
+  },
+
+  set bool(opt) {
+    Object.assign(resolveSeq.boolOptions, opt);
+  },
+
+  get int() {
+    return resolveSeq.intOptions;
+  },
+
+  set int(opt) {
+    Object.assign(resolveSeq.intOptions, opt);
+  },
+
+  get null() {
+    return resolveSeq.nullOptions;
+  },
+
+  set null(opt) {
+    Object.assign(resolveSeq.nullOptions, opt);
+  },
+
+  get str() {
+    return resolveSeq.strOptions;
+  },
+
+  set str(opt) {
+    Object.assign(resolveSeq.strOptions, opt);
+  }
+
+};
+const documentOptions = {
+  '1.0': {
+    schema: 'yaml-1.1',
+    merge: true,
+    tagPrefixes: [{
+      handle: '!',
+      prefix: PlainValue.defaultTagPrefix
+    }, {
+      handle: '!!',
+      prefix: 'tag:private.yaml.org,2002:'
+    }]
+  },
+  1.1: {
+    schema: 'yaml-1.1',
+    merge: true,
+    tagPrefixes: [{
+      handle: '!',
+      prefix: '!'
+    }, {
+      handle: '!!',
+      prefix: PlainValue.defaultTagPrefix
+    }]
+  },
+  1.2: {
+    schema: 'core',
+    merge: false,
+    tagPrefixes: [{
+      handle: '!',
+      prefix: '!'
+    }, {
+      handle: '!!',
+      prefix: PlainValue.defaultTagPrefix
+    }]
+  }
+};
+
+function stringifyTag(doc, tag) {
+  if ((doc.version || doc.options.version) === '1.0') {
+    const priv = tag.match(/^tag:private\.yaml\.org,2002:([^:/]+)$/);
+    if (priv) return '!' + priv[1];
+    const vocab = tag.match(/^tag:([a-zA-Z0-9-]+)\.yaml\.org,2002:(.*)/);
+    return vocab ? `!${vocab[1]}/${vocab[2]}` : `!${tag.replace(/^tag:/, '')}`;
+  }
+
+  let p = doc.tagPrefixes.find(p => tag.indexOf(p.prefix) === 0);
+
+  if (!p) {
+    const dtp = doc.getDefaults().tagPrefixes;
+    p = dtp && dtp.find(p => tag.indexOf(p.prefix) === 0);
+  }
+
+  if (!p) return tag[0] === '!' ? tag : `!<${tag}>`;
+  const suffix = tag.substr(p.prefix.length).replace(/[!,[\]{}]/g, ch => ({
+    '!': '%21',
+    ',': '%2C',
+    '[': '%5B',
+    ']': '%5D',
+    '{': '%7B',
+    '}': '%7D'
+  })[ch]);
+  return p.handle + suffix;
+}
+
+function getTagObject(tags, item) {
+  if (item instanceof resolveSeq.Alias) return resolveSeq.Alias;
+
+  if (item.tag) {
+    const match = tags.filter(t => t.tag === item.tag);
+    if (match.length > 0) return match.find(t => t.format === item.format) || match[0];
+  }
+
+  let tagObj, obj;
+
+  if (item instanceof resolveSeq.Scalar) {
+    obj = item.value; // TODO: deprecate/remove class check
+
+    const match = tags.filter(t => t.identify && t.identify(obj) || t.class && obj instanceof t.class);
+    tagObj = match.find(t => t.format === item.format) || match.find(t => !t.format);
+  } else {
+    obj = item;
+    tagObj = tags.find(t => t.nodeClass && obj instanceof t.nodeClass);
+  }
+
+  if (!tagObj) {
+    const name = obj && obj.constructor ? obj.constructor.name : typeof obj;
+    throw new Error(`Tag not resolved for ${name} value`);
+  }
+
+  return tagObj;
+} // needs to be called before value stringifier to allow for circular anchor refs
+
+
+function stringifyProps(node, tagObj, {
+  anchors,
+  doc
+}) {
+  const props = [];
+  const anchor = doc.anchors.getName(node);
+
+  if (anchor) {
+    anchors[anchor] = node;
+    props.push(`&${anchor}`);
+  }
+
+  if (node.tag) {
+    props.push(stringifyTag(doc, node.tag));
+  } else if (!tagObj.default) {
+    props.push(stringifyTag(doc, tagObj.tag));
+  }
+
+  return props.join(' ');
+}
+
+function stringify(item, ctx, onComment, onChompKeep) {
+  const {
+    anchors,
+    schema
+  } = ctx.doc;
+  let tagObj;
+
+  if (!(item instanceof resolveSeq.Node)) {
+    const createCtx = {
+      aliasNodes: [],
+      onTagObj: o => tagObj = o,
+      prevObjects: new Map()
+    };
+    item = schema.createNode(item, true, null, createCtx);
+
+    for (const alias of createCtx.aliasNodes) {
+      alias.source = alias.source.node;
+      let name = anchors.getName(alias.source);
+
+      if (!name) {
+        name = anchors.newName();
+        anchors.map[name] = alias.source;
+      }
+    }
+  }
+
+  if (item instanceof resolveSeq.Pair) return item.toString(ctx, onComment, onChompKeep);
+  if (!tagObj) tagObj = getTagObject(schema.tags, item);
+  const props = stringifyProps(item, tagObj, ctx);
+  if (props.length > 0) ctx.indentAtStart = (ctx.indentAtStart || 0) + props.length + 1;
+  const str = typeof tagObj.stringify === 'function' ? tagObj.stringify(item, ctx, onComment, onChompKeep) : item instanceof resolveSeq.Scalar ? resolveSeq.stringifyString(item, ctx, onComment, onChompKeep) : item.toString(ctx, onComment, onChompKeep);
+  if (!props) return str;
+  return item instanceof resolveSeq.Scalar || str[0] === '{' || str[0] === '[' ? `${props} ${str}` : `${props}\n${ctx.indent}${str}`;
+}
+
+class Anchors {
+  static validAnchorNode(node) {
+    return node instanceof resolveSeq.Scalar || node instanceof resolveSeq.YAMLSeq || node instanceof resolveSeq.YAMLMap;
+  }
+
+  constructor(prefix) {
+    PlainValue._defineProperty(this, "map", Object.create(null));
+
+    this.prefix = prefix;
+  }
+
+  createAlias(node, name) {
+    this.setAnchor(node, name);
+    return new resolveSeq.Alias(node);
+  }
+
+  createMergePair(...sources) {
+    const merge = new resolveSeq.Merge();
+    merge.value.items = sources.map(s => {
+      if (s instanceof resolveSeq.Alias) {
+        if (s.source instanceof resolveSeq.YAMLMap) return s;
+      } else if (s instanceof resolveSeq.YAMLMap) {
+        return this.createAlias(s);
+      }
+
+      throw new Error('Merge sources must be Map nodes or their Aliases');
+    });
+    return merge;
+  }
+
+  getName(node) {
+    const {
+      map
+    } = this;
+    return Object.keys(map).find(a => map[a] === node);
+  }
+
+  getNames() {
+    return Object.keys(this.map);
+  }
+
+  getNode(name) {
+    return this.map[name];
+  }
+
+  newName(prefix) {
+    if (!prefix) prefix = this.prefix;
+    const names = Object.keys(this.map);
+
+    for (let i = 1; true; ++i) {
+      const name = `${prefix}${i}`;
+      if (!names.includes(name)) return name;
+    }
+  } // During parsing, map & aliases contain CST nodes
+
+
+  resolveNodes() {
+    const {
+      map,
+      _cstAliases
+    } = this;
+    Object.keys(map).forEach(a => {
+      map[a] = map[a].resolved;
+    });
+
+    _cstAliases.forEach(a => {
+      a.source = a.source.resolved;
+    });
+
+    delete this._cstAliases;
+  }
+
+  setAnchor(node, name) {
+    if (node != null && !Anchors.validAnchorNode(node)) {
+      throw new Error('Anchors may only be set for Scalar, Seq and Map nodes');
+    }
+
+    if (name && /[\x00-\x19\s,[\]{}]/.test(name)) {
+      throw new Error('Anchor names must not contain whitespace or control characters');
+    }
+
+    const {
+      map
+    } = this;
+    const prev = node && Object.keys(map).find(a => map[a] === node);
+
+    if (prev) {
+      if (!name) {
+        return prev;
+      } else if (prev !== name) {
+        delete map[prev];
+        map[name] = node;
+      }
+    } else {
+      if (!name) {
+        if (!node) return null;
+        name = this.newName();
+      }
+
+      map[name] = node;
+    }
+
+    return name;
+  }
+
+}
+
+const visit = (node, tags) => {
+  if (node && typeof node === 'object') {
+    const {
+      tag
+    } = node;
+
+    if (node instanceof resolveSeq.Collection) {
+      if (tag) tags[tag] = true;
+      node.items.forEach(n => visit(n, tags));
+    } else if (node instanceof resolveSeq.Pair) {
+      visit(node.key, tags);
+      visit(node.value, tags);
+    } else if (node instanceof resolveSeq.Scalar) {
+      if (tag) tags[tag] = true;
+    }
+  }
+
+  return tags;
+};
+
+const listTagNames = node => Object.keys(visit(node, {}));
+
+function parseContents(doc, contents) {
+  const comments = {
+    before: [],
+    after: []
+  };
+  let body = undefined;
+  let spaceBefore = false;
+
+  for (const node of contents) {
+    if (node.valueRange) {
+      if (body !== undefined) {
+        const msg = 'Document contains trailing content not separated by a ... or --- line';
+        doc.errors.push(new PlainValue.YAMLSyntaxError(node, msg));
+        break;
+      }
+
+      const res = resolveSeq.resolveNode(doc, node);
+
+      if (spaceBefore) {
+        res.spaceBefore = true;
+        spaceBefore = false;
+      }
+
+      body = res;
+    } else if (node.comment !== null) {
+      const cc = body === undefined ? comments.before : comments.after;
+      cc.push(node.comment);
+    } else if (node.type === PlainValue.Type.BLANK_LINE) {
+      spaceBefore = true;
+
+      if (body === undefined && comments.before.length > 0 && !doc.commentBefore) {
+        // space-separated comments at start are parsed as document comments
+        doc.commentBefore = comments.before.join('\n');
+        comments.before = [];
+      }
+    }
+  }
+
+  doc.contents = body || null;
+
+  if (!body) {
+    doc.comment = comments.before.concat(comments.after).join('\n') || null;
+  } else {
+    const cb = comments.before.join('\n');
+
+    if (cb) {
+      const cbNode = body instanceof resolveSeq.Collection && body.items[0] ? body.items[0] : body;
+      cbNode.commentBefore = cbNode.commentBefore ? `${cb}\n${cbNode.commentBefore}` : cb;
+    }
+
+    doc.comment = comments.after.join('\n') || null;
+  }
+}
+
+function resolveTagDirective({
+  tagPrefixes
+}, directive) {
+  const [handle, prefix] = directive.parameters;
+
+  if (!handle || !prefix) {
+    const msg = 'Insufficient parameters given for %TAG directive';
+    throw new PlainValue.YAMLSemanticError(directive, msg);
+  }
+
+  if (tagPrefixes.some(p => p.handle === handle)) {
+    const msg = 'The %TAG directive must only be given at most once per handle in the same document.';
+    throw new PlainValue.YAMLSemanticError(directive, msg);
+  }
+
+  return {
+    handle,
+    prefix
+  };
+}
+
+function resolveYamlDirective(doc, directive) {
+  let [version] = directive.parameters;
+  if (directive.name === 'YAML:1.0') version = '1.0';
+
+  if (!version) {
+    const msg = 'Insufficient parameters given for %YAML directive';
+    throw new PlainValue.YAMLSemanticError(directive, msg);
+  }
+
+  if (!documentOptions[version]) {
+    const v0 = doc.version || doc.options.version;
+    const msg = `Document will be parsed as YAML ${v0} rather than YAML ${version}`;
+    doc.warnings.push(new PlainValue.YAMLWarning(directive, msg));
+  }
+
+  return version;
+}
+
+function parseDirectives(doc, directives, prevDoc) {
+  const directiveComments = [];
+  let hasDirectives = false;
+
+  for (const directive of directives) {
+    const {
+      comment,
+      name
+    } = directive;
+
+    switch (name) {
+      case 'TAG':
+        try {
+          doc.tagPrefixes.push(resolveTagDirective(doc, directive));
+        } catch (error) {
+          doc.errors.push(error);
+        }
+
+        hasDirectives = true;
+        break;
+
+      case 'YAML':
+      case 'YAML:1.0':
+        if (doc.version) {
+          const msg = 'The %YAML directive must only be given at most once per document.';
+          doc.errors.push(new PlainValue.YAMLSemanticError(directive, msg));
+        }
+
+        try {
+          doc.version = resolveYamlDirective(doc, directive);
+        } catch (error) {
+          doc.errors.push(error);
+        }
+
+        hasDirectives = true;
+        break;
+
+      default:
+        if (name) {
+          const msg = `YAML only supports %TAG and %YAML directives, and not %${name}`;
+          doc.warnings.push(new PlainValue.YAMLWarning(directive, msg));
+        }
+
+    }
+
+    if (comment) directiveComments.push(comment);
+  }
+
+  if (prevDoc && !hasDirectives && '1.1' === (doc.version || prevDoc.version || doc.options.version)) {
+    const copyTagPrefix = ({
+      handle,
+      prefix
+    }) => ({
+      handle,
+      prefix
+    });
+
+    doc.tagPrefixes = prevDoc.tagPrefixes.map(copyTagPrefix);
+    doc.version = prevDoc.version;
+  }
+
+  doc.commentBefore = directiveComments.join('\n') || null;
+}
+
+function assertCollection(contents) {
+  if (contents instanceof resolveSeq.Collection) return true;
+  throw new Error('Expected a YAML collection as document contents');
+}
+
+class Document {
+  constructor(options) {
+    this.anchors = new Anchors(options.anchorPrefix);
+    this.commentBefore = null;
+    this.comment = null;
+    this.contents = null;
+    this.directivesEndMarker = null;
+    this.errors = [];
+    this.options = options;
+    this.schema = null;
+    this.tagPrefixes = [];
+    this.version = null;
+    this.warnings = [];
+  }
+
+  add(value) {
+    assertCollection(this.contents);
+    return this.contents.add(value);
+  }
+
+  addIn(path, value) {
+    assertCollection(this.contents);
+    this.contents.addIn(path, value);
+  }
+
+  delete(key) {
+    assertCollection(this.contents);
+    return this.contents.delete(key);
+  }
+
+  deleteIn(path) {
+    if (resolveSeq.isEmptyPath(path)) {
+      if (this.contents == null) return false;
+      this.contents = null;
+      return true;
+    }
+
+    assertCollection(this.contents);
+    return this.contents.deleteIn(path);
+  }
+
+  getDefaults() {
+    return Document.defaults[this.version] || Document.defaults[this.options.version] || {};
+  }
+
+  get(key, keepScalar) {
+    return this.contents instanceof resolveSeq.Collection ? this.contents.get(key, keepScalar) : undefined;
+  }
+
+  getIn(path, keepScalar) {
+    if (resolveSeq.isEmptyPath(path)) return !keepScalar && this.contents instanceof resolveSeq.Scalar ? this.contents.value : this.contents;
+    return this.contents instanceof resolveSeq.Collection ? this.contents.getIn(path, keepScalar) : undefined;
+  }
+
+  has(key) {
+    return this.contents instanceof resolveSeq.Collection ? this.contents.has(key) : false;
+  }
+
+  hasIn(path) {
+    if (resolveSeq.isEmptyPath(path)) return this.contents !== undefined;
+    return this.contents instanceof resolveSeq.Collection ? this.contents.hasIn(path) : false;
+  }
+
+  set(key, value) {
+    assertCollection(this.contents);
+    this.contents.set(key, value);
+  }
+
+  setIn(path, value) {
+    if (resolveSeq.isEmptyPath(path)) this.contents = value;else {
+      assertCollection(this.contents);
+      this.contents.setIn(path, value);
+    }
+  }
+
+  setSchema(id, customTags) {
+    if (!id && !customTags && this.schema) return;
+    if (typeof id === 'number') id = id.toFixed(1);
+
+    if (id === '1.0' || id === '1.1' || id === '1.2') {
+      if (this.version) this.version = id;else this.options.version = id;
+      delete this.options.schema;
+    } else if (id && typeof id === 'string') {
+      this.options.schema = id;
+    }
+
+    if (Array.isArray(customTags)) this.options.customTags = customTags;
+    const opt = Object.assign({}, this.getDefaults(), this.options);
+    this.schema = new Schema.Schema(opt);
+  }
+
+  parse(node, prevDoc) {
+    if (this.options.keepCstNodes) this.cstNode = node;
+    if (this.options.keepNodeTypes) this.type = 'DOCUMENT';
+    const {
+      directives = [],
+      contents = [],
+      directivesEndMarker,
+      error,
+      valueRange
+    } = node;
+
+    if (error) {
+      if (!error.source) error.source = this;
+      this.errors.push(error);
+    }
+
+    parseDirectives(this, directives, prevDoc);
+    if (directivesEndMarker) this.directivesEndMarker = true;
+    this.range = valueRange ? [valueRange.start, valueRange.end] : null;
+    this.setSchema();
+    this.anchors._cstAliases = [];
+    parseContents(this, contents);
+    this.anchors.resolveNodes();
+
+    if (this.options.prettyErrors) {
+      for (const error of this.errors) if (error instanceof PlainValue.YAMLError) error.makePretty();
+
+      for (const warn of this.warnings) if (warn instanceof PlainValue.YAMLError) warn.makePretty();
+    }
+
+    return this;
+  }
+
+  listNonDefaultTags() {
+    return listTagNames(this.contents).filter(t => t.indexOf(Schema.Schema.defaultPrefix) !== 0);
+  }
+
+  setTagPrefix(handle, prefix) {
+    if (handle[0] !== '!' || handle[handle.length - 1] !== '!') throw new Error('Handle must start and end with !');
+
+    if (prefix) {
+      const prev = this.tagPrefixes.find(p => p.handle === handle);
+      if (prev) prev.prefix = prefix;else this.tagPrefixes.push({
+        handle,
+        prefix
+      });
+    } else {
+      this.tagPrefixes = this.tagPrefixes.filter(p => p.handle !== handle);
+    }
+  }
+
+  toJSON(arg, onAnchor) {
+    const {
+      keepBlobsInJSON,
+      mapAsMap,
+      maxAliasCount
+    } = this.options;
+    const keep = keepBlobsInJSON && (typeof arg !== 'string' || !(this.contents instanceof resolveSeq.Scalar));
+    const ctx = {
+      doc: this,
+      indentStep: '  ',
+      keep,
+      mapAsMap: keep && !!mapAsMap,
+      maxAliasCount,
+      stringify // Requiring directly in Pair would create circular dependencies
+
+    };
+    const anchorNames = Object.keys(this.anchors.map);
+    if (anchorNames.length > 0) ctx.anchors = new Map(anchorNames.map(name => [this.anchors.map[name], {
+      alias: [],
+      aliasCount: 0,
+      count: 1
+    }]));
+    const res = resolveSeq.toJSON(this.contents, arg, ctx);
+    if (typeof onAnchor === 'function' && ctx.anchors) for (const {
+      count,
+      res
+    } of ctx.anchors.values()) onAnchor(res, count);
+    return res;
+  }
+
+  toString() {
+    if (this.errors.length > 0) throw new Error('Document with errors cannot be stringified');
+    const indentSize = this.options.indent;
+
+    if (!Number.isInteger(indentSize) || indentSize <= 0) {
+      const s = JSON.stringify(indentSize);
+      throw new Error(`"indent" option must be a positive integer, not ${s}`);
+    }
+
+    this.setSchema();
+    const lines = [];
+    let hasDirectives = false;
+
+    if (this.version) {
+      let vd = '%YAML 1.2';
+
+      if (this.schema.name === 'yaml-1.1') {
+        if (this.version === '1.0') vd = '%YAML:1.0';else if (this.version === '1.1') vd = '%YAML 1.1';
+      }
+
+      lines.push(vd);
+      hasDirectives = true;
+    }
+
+    const tagNames = this.listNonDefaultTags();
+    this.tagPrefixes.forEach(({
+      handle,
+      prefix
+    }) => {
+      if (tagNames.some(t => t.indexOf(prefix) === 0)) {
+        lines.push(`%TAG ${handle} ${prefix}`);
+        hasDirectives = true;
+      }
+    });
+    if (hasDirectives || this.directivesEndMarker) lines.push('---');
+
+    if (this.commentBefore) {
+      if (hasDirectives || !this.directivesEndMarker) lines.unshift('');
+      lines.unshift(this.commentBefore.replace(/^/gm, '#'));
+    }
+
+    const ctx = {
+      anchors: Object.create(null),
+      doc: this,
+      indent: '',
+      indentStep: ' '.repeat(indentSize),
+      stringify // Requiring directly in nodes would create circular dependencies
+
+    };
+    let chompKeep = false;
+    let contentComment = null;
+
+    if (this.contents) {
+      if (this.contents instanceof resolveSeq.Node) {
+        if (this.contents.spaceBefore && (hasDirectives || this.directivesEndMarker)) lines.push('');
+        if (this.contents.commentBefore) lines.push(this.contents.commentBefore.replace(/^/gm, '#')); // top-level block scalars need to be indented if followed by a comment
+
+        ctx.forceBlockIndent = !!this.comment;
+        contentComment = this.contents.comment;
+      }
+
+      const onChompKeep = contentComment ? null : () => chompKeep = true;
+      const body = stringify(this.contents, ctx, () => contentComment = null, onChompKeep);
+      lines.push(resolveSeq.addComment(body, '', contentComment));
+    } else if (this.contents !== undefined) {
+      lines.push(stringify(this.contents, ctx));
+    }
+
+    if (this.comment) {
+      if ((!chompKeep || contentComment) && lines[lines.length - 1] !== '') lines.push('');
+      lines.push(this.comment.replace(/^/gm, '#'));
+    }
+
+    return lines.join('\n') + '\n';
+  }
+
+}
+
+PlainValue._defineProperty(Document, "defaults", documentOptions);
+
+exports.Document = Document;
+exports.defaultOptions = defaultOptions;
+exports.scalarOptions = scalarOptions;
+
+
+/***/ }),
+
 /***/ 813:
 /***/ (function(__unusedmodule, exports) {
 
@@ -13808,6 +13957,7 @@ const Endpoints = {
   actions: {
     addSelectedRepoToOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}/repositories/{repository_id}"],
     cancelWorkflowRun: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel"],
+    createOrUpdateEnvironmentSecret: ["PUT /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
     createOrUpdateOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}"],
     createOrUpdateRepoSecret: ["PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
     createRegistrationTokenForOrg: ["POST /orgs/{org}/actions/runners/registration-token"],
@@ -13816,21 +13966,37 @@ const Endpoints = {
     createRemoveTokenForRepo: ["POST /repos/{owner}/{repo}/actions/runners/remove-token"],
     createWorkflowDispatch: ["POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"],
     deleteArtifact: ["DELETE /repos/{owner}/{repo}/actions/artifacts/{artifact_id}"],
+    deleteEnvironmentSecret: ["DELETE /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
     deleteOrgSecret: ["DELETE /orgs/{org}/actions/secrets/{secret_name}"],
     deleteRepoSecret: ["DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
     deleteSelfHostedRunnerFromOrg: ["DELETE /orgs/{org}/actions/runners/{runner_id}"],
     deleteSelfHostedRunnerFromRepo: ["DELETE /repos/{owner}/{repo}/actions/runners/{runner_id}"],
     deleteWorkflowRun: ["DELETE /repos/{owner}/{repo}/actions/runs/{run_id}"],
     deleteWorkflowRunLogs: ["DELETE /repos/{owner}/{repo}/actions/runs/{run_id}/logs"],
+    disableSelectedRepositoryGithubActionsOrganization: ["DELETE /orgs/{org}/actions/permissions/repositories/{repository_id}"],
+    disableWorkflow: ["PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable"],
     downloadArtifact: ["GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/{archive_format}"],
     downloadJobLogsForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs"],
     downloadWorkflowRunLogs: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs"],
+    enableSelectedRepositoryGithubActionsOrganization: ["PUT /orgs/{org}/actions/permissions/repositories/{repository_id}"],
+    enableWorkflow: ["PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable"],
+    getAllowedActionsOrganization: ["GET /orgs/{org}/actions/permissions/selected-actions"],
+    getAllowedActionsRepository: ["GET /repos/{owner}/{repo}/actions/permissions/selected-actions"],
     getArtifact: ["GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}"],
+    getEnvironmentPublicKey: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets/public-key"],
+    getEnvironmentSecret: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}"],
+    getGithubActionsPermissionsOrganization: ["GET /orgs/{org}/actions/permissions"],
+    getGithubActionsPermissionsRepository: ["GET /repos/{owner}/{repo}/actions/permissions"],
     getJobForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/jobs/{job_id}"],
     getOrgPublicKey: ["GET /orgs/{org}/actions/secrets/public-key"],
     getOrgSecret: ["GET /orgs/{org}/actions/secrets/{secret_name}"],
+    getPendingDeploymentsForRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments"],
+    getRepoPermissions: ["GET /repos/{owner}/{repo}/actions/permissions", {}, {
+      renamed: ["actions", "getGithubActionsPermissionsRepository"]
+    }],
     getRepoPublicKey: ["GET /repos/{owner}/{repo}/actions/secrets/public-key"],
     getRepoSecret: ["GET /repos/{owner}/{repo}/actions/secrets/{secret_name}"],
+    getReviewsForRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/approvals"],
     getSelfHostedRunnerForOrg: ["GET /orgs/{org}/actions/runners/{runner_id}"],
     getSelfHostedRunnerForRepo: ["GET /repos/{owner}/{repo}/actions/runners/{runner_id}"],
     getWorkflow: ["GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}"],
@@ -13838,6 +14004,7 @@ const Endpoints = {
     getWorkflowRunUsage: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/timing"],
     getWorkflowUsage: ["GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/timing"],
     listArtifactsForRepo: ["GET /repos/{owner}/{repo}/actions/artifacts"],
+    listEnvironmentSecrets: ["GET /repositories/{repository_id}/environments/{environment_name}/secrets"],
     listJobsForWorkflowRun: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs"],
     listOrgSecrets: ["GET /orgs/{org}/actions/secrets"],
     listRepoSecrets: ["GET /repos/{owner}/{repo}/actions/secrets"],
@@ -13845,6 +14012,7 @@ const Endpoints = {
     listRunnerApplicationsForOrg: ["GET /orgs/{org}/actions/runners/downloads"],
     listRunnerApplicationsForRepo: ["GET /repos/{owner}/{repo}/actions/runners/downloads"],
     listSelectedReposForOrgSecret: ["GET /orgs/{org}/actions/secrets/{secret_name}/repositories"],
+    listSelectedRepositoriesEnabledGithubActionsOrganization: ["GET /orgs/{org}/actions/permissions/repositories"],
     listSelfHostedRunnersForOrg: ["GET /orgs/{org}/actions/runners"],
     listSelfHostedRunnersForRepo: ["GET /repos/{owner}/{repo}/actions/runners"],
     listWorkflowRunArtifacts: ["GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts"],
@@ -13852,7 +14020,13 @@ const Endpoints = {
     listWorkflowRunsForRepo: ["GET /repos/{owner}/{repo}/actions/runs"],
     reRunWorkflow: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun"],
     removeSelectedRepoFromOrgSecret: ["DELETE /orgs/{org}/actions/secrets/{secret_name}/repositories/{repository_id}"],
-    setSelectedReposForOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}/repositories"]
+    reviewPendingDeploymentsForRun: ["POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments"],
+    setAllowedActionsOrganization: ["PUT /orgs/{org}/actions/permissions/selected-actions"],
+    setAllowedActionsRepository: ["PUT /repos/{owner}/{repo}/actions/permissions/selected-actions"],
+    setGithubActionsPermissionsOrganization: ["PUT /orgs/{org}/actions/permissions"],
+    setGithubActionsPermissionsRepository: ["PUT /repos/{owner}/{repo}/actions/permissions"],
+    setSelectedReposForOrgSecret: ["PUT /orgs/{org}/actions/secrets/{secret_name}/repositories"],
+    setSelectedRepositoriesEnabledGithubActionsOrganization: ["PUT /orgs/{org}/actions/permissions/repositories"]
   },
   activity: {
     checkRepoIsStarredByAuthenticatedUser: ["GET /user/starred/{owner}/{repo}"],
@@ -13888,11 +14062,7 @@ const Endpoints = {
     unstarRepoForAuthenticatedUser: ["DELETE /user/starred/{owner}/{repo}"]
   },
   apps: {
-    addRepoToInstallation: ["PUT /user/installations/{installation_id}/repositories/{repository_id}", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    addRepoToInstallation: ["PUT /user/installations/{installation_id}/repositories/{repository_id}"],
     checkToken: ["POST /applications/{client_id}/token"],
     createContentAttachment: ["POST /content_references/{content_reference_id}/attachments", {
       mediaType: {
@@ -13900,85 +14070,36 @@ const Endpoints = {
       }
     }],
     createFromManifest: ["POST /app-manifests/{code}/conversions"],
-    createInstallationAccessToken: ["POST /app/installations/{installation_id}/access_tokens", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    createInstallationAccessToken: ["POST /app/installations/{installation_id}/access_tokens"],
     deleteAuthorization: ["DELETE /applications/{client_id}/grant"],
-    deleteInstallation: ["DELETE /app/installations/{installation_id}", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    deleteInstallation: ["DELETE /app/installations/{installation_id}"],
     deleteToken: ["DELETE /applications/{client_id}/token"],
-    getAuthenticated: ["GET /app", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    getBySlug: ["GET /apps/{app_slug}", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    getInstallation: ["GET /app/installations/{installation_id}", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    getOrgInstallation: ["GET /orgs/{org}/installation", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    getRepoInstallation: ["GET /repos/{owner}/{repo}/installation", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    getAuthenticated: ["GET /app"],
+    getBySlug: ["GET /apps/{app_slug}"],
+    getInstallation: ["GET /app/installations/{installation_id}"],
+    getOrgInstallation: ["GET /orgs/{org}/installation"],
+    getRepoInstallation: ["GET /repos/{owner}/{repo}/installation"],
     getSubscriptionPlanForAccount: ["GET /marketplace_listing/accounts/{account_id}"],
     getSubscriptionPlanForAccountStubbed: ["GET /marketplace_listing/stubbed/accounts/{account_id}"],
-    getUserInstallation: ["GET /users/{username}/installation", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    getUserInstallation: ["GET /users/{username}/installation"],
+    getWebhookConfigForApp: ["GET /app/hook/config"],
     listAccountsForPlan: ["GET /marketplace_listing/plans/{plan_id}/accounts"],
     listAccountsForPlanStubbed: ["GET /marketplace_listing/stubbed/plans/{plan_id}/accounts"],
-    listInstallationReposForAuthenticatedUser: ["GET /user/installations/{installation_id}/repositories", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    listInstallations: ["GET /app/installations", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
-    listInstallationsForAuthenticatedUser: ["GET /user/installations", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    listInstallationReposForAuthenticatedUser: ["GET /user/installations/{installation_id}/repositories"],
+    listInstallations: ["GET /app/installations"],
+    listInstallationsForAuthenticatedUser: ["GET /user/installations"],
     listPlans: ["GET /marketplace_listing/plans"],
     listPlansStubbed: ["GET /marketplace_listing/stubbed/plans"],
-    listReposAccessibleToInstallation: ["GET /installation/repositories", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    listReposAccessibleToInstallation: ["GET /installation/repositories"],
     listSubscriptionsForAuthenticatedUser: ["GET /user/marketplace_purchases"],
     listSubscriptionsForAuthenticatedUserStubbed: ["GET /user/marketplace_purchases/stubbed"],
-    removeRepoFromInstallation: ["DELETE /user/installations/{installation_id}/repositories/{repository_id}", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    removeRepoFromInstallation: ["DELETE /user/installations/{installation_id}/repositories/{repository_id}"],
     resetToken: ["PATCH /applications/{client_id}/token"],
     revokeInstallationAccessToken: ["DELETE /installation/token"],
+    scopeToken: ["POST /applications/{client_id}/token/scoped"],
     suspendInstallation: ["PUT /app/installations/{installation_id}/suspended"],
-    unsuspendInstallation: ["DELETE /app/installations/{installation_id}/suspended"]
+    unsuspendInstallation: ["DELETE /app/installations/{installation_id}/suspended"],
+    updateWebhookConfigForApp: ["PATCH /app/hook/config"]
   },
   billing: {
     getGithubActionsBillingOrg: ["GET /orgs/{org}/settings/billing/actions"],
@@ -13989,65 +14110,32 @@ const Endpoints = {
     getSharedStorageBillingUser: ["GET /users/{username}/settings/billing/shared-storage"]
   },
   checks: {
-    create: ["POST /repos/{owner}/{repo}/check-runs", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    createSuite: ["POST /repos/{owner}/{repo}/check-suites", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    get: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    getSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    listAnnotations: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    listForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-runs", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    listForSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    listSuitesForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-suites", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    rerequestSuite: ["POST /repos/{owner}/{repo}/check-suites/{check_suite_id}/rerequest", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    setSuitesPreferences: ["PATCH /repos/{owner}/{repo}/check-suites/preferences", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }],
-    update: ["PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}", {
-      mediaType: {
-        previews: ["antiope"]
-      }
-    }]
+    create: ["POST /repos/{owner}/{repo}/check-runs"],
+    createSuite: ["POST /repos/{owner}/{repo}/check-suites"],
+    get: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}"],
+    getSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}"],
+    listAnnotations: ["GET /repos/{owner}/{repo}/check-runs/{check_run_id}/annotations"],
+    listForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-runs"],
+    listForSuite: ["GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs"],
+    listSuitesForRef: ["GET /repos/{owner}/{repo}/commits/{ref}/check-suites"],
+    rerequestSuite: ["POST /repos/{owner}/{repo}/check-suites/{check_suite_id}/rerequest"],
+    setSuitesPreferences: ["PATCH /repos/{owner}/{repo}/check-suites/preferences"],
+    update: ["PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}"]
   },
   codeScanning: {
-    getAlert: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_id}"],
-    listAlertsForRepo: ["GET /repos/{owner}/{repo}/code-scanning/alerts"]
+    deleteAnalysis: ["DELETE /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}{?confirm_delete}"],
+    getAlert: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}", {}, {
+      renamedParameters: {
+        alert_id: "alert_number"
+      }
+    }],
+    getAnalysis: ["GET /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}"],
+    getSarif: ["GET /repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}"],
+    listAlertsForRepo: ["GET /repos/{owner}/{repo}/code-scanning/alerts"],
+    listAlertsInstances: ["GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}/instances"],
+    listRecentAnalyses: ["GET /repos/{owner}/{repo}/code-scanning/analyses"],
+    updateAlert: ["PATCH /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}"],
+    uploadSarif: ["POST /repos/{owner}/{repo}/code-scanning/sarifs"]
   },
   codesOfConduct: {
     getAllCodesOfConduct: ["GET /codes_of_conduct", {
@@ -14068,6 +14156,16 @@ const Endpoints = {
   },
   emojis: {
     get: ["GET /emojis"]
+  },
+  enterpriseAdmin: {
+    disableSelectedOrganizationGithubActionsEnterprise: ["DELETE /enterprises/{enterprise}/actions/permissions/organizations/{org_id}"],
+    enableSelectedOrganizationGithubActionsEnterprise: ["PUT /enterprises/{enterprise}/actions/permissions/organizations/{org_id}"],
+    getAllowedActionsEnterprise: ["GET /enterprises/{enterprise}/actions/permissions/selected-actions"],
+    getGithubActionsPermissionsEnterprise: ["GET /enterprises/{enterprise}/actions/permissions"],
+    listSelectedOrganizationsEnabledGithubActionsEnterprise: ["GET /enterprises/{enterprise}/actions/permissions/organizations"],
+    setAllowedActionsEnterprise: ["PUT /enterprises/{enterprise}/actions/permissions/selected-actions"],
+    setGithubActionsPermissionsEnterprise: ["PUT /enterprises/{enterprise}/actions/permissions"],
+    setSelectedOrganizationsEnabledGithubActionsEnterprise: ["PUT /enterprises/{enterprise}/actions/permissions/organizations"]
   },
   gists: {
     checkIsStarred: ["GET /gists/{gist_id}/star"],
@@ -14111,35 +14209,23 @@ const Endpoints = {
     getTemplate: ["GET /gitignore/templates/{name}"]
   },
   interactions: {
-    getRestrictionsForOrg: ["GET /orgs/{org}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
+    getRestrictionsForAuthenticatedUser: ["GET /user/interaction-limits"],
+    getRestrictionsForOrg: ["GET /orgs/{org}/interaction-limits"],
+    getRestrictionsForRepo: ["GET /repos/{owner}/{repo}/interaction-limits"],
+    getRestrictionsForYourPublicRepos: ["GET /user/interaction-limits", {}, {
+      renamed: ["interactions", "getRestrictionsForAuthenticatedUser"]
     }],
-    getRestrictionsForRepo: ["GET /repos/{owner}/{repo}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
+    removeRestrictionsForAuthenticatedUser: ["DELETE /user/interaction-limits"],
+    removeRestrictionsForOrg: ["DELETE /orgs/{org}/interaction-limits"],
+    removeRestrictionsForRepo: ["DELETE /repos/{owner}/{repo}/interaction-limits"],
+    removeRestrictionsForYourPublicRepos: ["DELETE /user/interaction-limits", {}, {
+      renamed: ["interactions", "removeRestrictionsForAuthenticatedUser"]
     }],
-    removeRestrictionsForOrg: ["DELETE /orgs/{org}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
-    }],
-    removeRestrictionsForRepo: ["DELETE /repos/{owner}/{repo}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
-    }],
-    setRestrictionsForOrg: ["PUT /orgs/{org}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
-    }],
-    setRestrictionsForRepo: ["PUT /repos/{owner}/{repo}/interaction-limits", {
-      mediaType: {
-        previews: ["sombra"]
-      }
+    setRestrictionsForAuthenticatedUser: ["PUT /user/interaction-limits"],
+    setRestrictionsForOrg: ["PUT /orgs/{org}/interaction-limits"],
+    setRestrictionsForRepo: ["PUT /repos/{owner}/{repo}/interaction-limits"],
+    setRestrictionsForYourPublicRepos: ["PUT /user/interaction-limits", {}, {
+      renamed: ["interactions", "setRestrictionsForAuthenticatedUser"]
     }]
   },
   issues: {
@@ -14201,7 +14287,10 @@ const Endpoints = {
     }]
   },
   meta: {
-    get: ["GET /meta"]
+    get: ["GET /meta"],
+    getOctocat: ["GET /octocat"],
+    getZen: ["GET /zen"],
+    root: ["GET /"]
   },
   migrations: {
     cancelImport: ["DELETE /repos/{owner}/{repo}/import"],
@@ -14277,6 +14366,7 @@ const Endpoints = {
   },
   orgs: {
     blockUser: ["PUT /orgs/{org}/blocks/{username}"],
+    cancelInvitation: ["DELETE /orgs/{org}/invitations/{invitation_id}"],
     checkBlockedUser: ["GET /orgs/{org}/blocks/{username}"],
     checkMembershipForUser: ["GET /orgs/{org}/members/{username}"],
     checkPublicMembershipForUser: ["GET /orgs/{org}/public_members/{username}"],
@@ -14288,13 +14378,11 @@ const Endpoints = {
     getMembershipForAuthenticatedUser: ["GET /user/memberships/orgs/{org}"],
     getMembershipForUser: ["GET /orgs/{org}/memberships/{username}"],
     getWebhook: ["GET /orgs/{org}/hooks/{hook_id}"],
+    getWebhookConfigForOrg: ["GET /orgs/{org}/hooks/{hook_id}/config"],
     list: ["GET /organizations"],
-    listAppInstallations: ["GET /orgs/{org}/installations", {
-      mediaType: {
-        previews: ["machine-man"]
-      }
-    }],
+    listAppInstallations: ["GET /orgs/{org}/installations"],
     listBlockedUsers: ["GET /orgs/{org}/blocks"],
+    listFailedInvitations: ["GET /orgs/{org}/failed_invitations"],
     listForAuthenticatedUser: ["GET /user/orgs"],
     listForUser: ["GET /users/{username}/orgs"],
     listInvitationTeams: ["GET /orgs/{org}/invitations/{invitation_id}/teams"],
@@ -14314,7 +14402,27 @@ const Endpoints = {
     unblockUser: ["DELETE /orgs/{org}/blocks/{username}"],
     update: ["PATCH /orgs/{org}"],
     updateMembershipForAuthenticatedUser: ["PATCH /user/memberships/orgs/{org}"],
-    updateWebhook: ["PATCH /orgs/{org}/hooks/{hook_id}"]
+    updateWebhook: ["PATCH /orgs/{org}/hooks/{hook_id}"],
+    updateWebhookConfigForOrg: ["PATCH /orgs/{org}/hooks/{hook_id}/config"]
+  },
+  packages: {
+    deletePackageForAuthenticatedUser: ["DELETE /user/packages/{package_type}/{package_name}"],
+    deletePackageForOrg: ["DELETE /orgs/{org}/packages/{package_type}/{package_name}"],
+    deletePackageVersionForAuthenticatedUser: ["DELETE /user/packages/{package_type}/{package_name}/versions/{package_version_id}"],
+    deletePackageVersionForOrg: ["DELETE /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
+    getAllPackageVersionsForAPackageOwnedByAnOrg: ["GET /orgs/{org}/packages/{package_type}/{package_name}/versions"],
+    getAllPackageVersionsForAPackageOwnedByTheAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}/versions"],
+    getAllPackageVersionsForPackageOwnedByUser: ["GET /users/{username}/packages/{package_type}/{package_name}/versions"],
+    getPackageForAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}"],
+    getPackageForOrganization: ["GET /orgs/{org}/packages/{package_type}/{package_name}"],
+    getPackageForUser: ["GET /users/{username}/packages/{package_type}/{package_name}"],
+    getPackageVersionForAuthenticatedUser: ["GET /user/packages/{package_type}/{package_name}/versions/{package_version_id}"],
+    getPackageVersionForOrganization: ["GET /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
+    getPackageVersionForUser: ["GET /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}"],
+    restorePackageForAuthenticatedUser: ["POST /user/packages/{package_type}/{package_name}/restore"],
+    restorePackageForOrg: ["POST /orgs/{org}/packages/{package_type}/{package_name}/restore"],
+    restorePackageVersionForAuthenticatedUser: ["POST /user/packages/{package_type}/{package_name}/versions/{package_version_id}/restore"],
+    restorePackageVersionForOrg: ["POST /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}/restore"]
   },
   projects: {
     addCollaborator: ["PUT /projects/{project_id}/collaborators/{username}", {
@@ -14545,7 +14653,7 @@ const Endpoints = {
         previews: ["squirrel-girl"]
       }
     }, {
-      deprecated: "octokit.reactions.deleteLegacy() is deprecated, see https://developer.github.com/v3/reactions/#delete-a-reaction-legacy"
+      deprecated: "octokit.reactions.deleteLegacy() is deprecated, see https://docs.github.com/rest/reference/reactions/#delete-a-reaction-legacy"
     }],
     listForCommitComment: ["GET /repos/{owner}/{repo}/comments/{comment_id}/reactions", {
       mediaType: {
@@ -14614,6 +14722,7 @@ const Endpoints = {
     createForAuthenticatedUser: ["POST /user/repos"],
     createFork: ["POST /repos/{owner}/{repo}/forks"],
     createInOrg: ["POST /orgs/{org}/repos"],
+    createOrUpdateEnvironment: ["PUT /repos/{owner}/{repo}/environments/{environment_name}"],
     createOrUpdateFileContents: ["PUT /repos/{owner}/{repo}/contents/{path}"],
     createPagesSite: ["POST /repos/{owner}/{repo}/pages", {
       mediaType: {
@@ -14631,6 +14740,7 @@ const Endpoints = {
     delete: ["DELETE /repos/{owner}/{repo}"],
     deleteAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions"],
     deleteAdminBranchProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/enforce_admins"],
+    deleteAnEnvironment: ["DELETE /repos/{owner}/{repo}/environments/{environment_name}"],
     deleteBranchProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection"],
     deleteCommitComment: ["DELETE /repos/{owner}/{repo}/comments/{comment_id}"],
     deleteCommitSignatureProtection: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/required_signatures", {
@@ -14661,7 +14771,11 @@ const Endpoints = {
         previews: ["dorian"]
       }
     }],
-    downloadArchive: ["GET /repos/{owner}/{repo}/{archive_format}/{ref}"],
+    downloadArchive: ["GET /repos/{owner}/{repo}/zipball/{ref}", {}, {
+      renamed: ["repos", "downloadZipballArchive"]
+    }],
+    downloadTarballArchive: ["GET /repos/{owner}/{repo}/tarball/{ref}"],
+    downloadZipballArchive: ["GET /repos/{owner}/{repo}/zipball/{ref}"],
     enableAutomatedSecurityFixes: ["PUT /repos/{owner}/{repo}/automated-security-fixes", {
       mediaType: {
         previews: ["london"]
@@ -14675,6 +14789,7 @@ const Endpoints = {
     get: ["GET /repos/{owner}/{repo}"],
     getAccessRestrictions: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions"],
     getAdminBranchProtection: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/enforce_admins"],
+    getAllEnvironments: ["GET /repos/{owner}/{repo}/environments"],
     getAllStatusCheckContexts: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks/contexts"],
     getAllTopics: ["GET /repos/{owner}/{repo}/topics", {
       mediaType: {
@@ -14696,16 +14811,13 @@ const Endpoints = {
         previews: ["zzzax"]
       }
     }],
-    getCommunityProfileMetrics: ["GET /repos/{owner}/{repo}/community/profile", {
-      mediaType: {
-        previews: ["black-panther"]
-      }
-    }],
+    getCommunityProfileMetrics: ["GET /repos/{owner}/{repo}/community/profile"],
     getContent: ["GET /repos/{owner}/{repo}/contents/{path}"],
     getContributorsStats: ["GET /repos/{owner}/{repo}/stats/contributors"],
     getDeployKey: ["GET /repos/{owner}/{repo}/keys/{key_id}"],
     getDeployment: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}"],
     getDeploymentStatus: ["GET /repos/{owner}/{repo}/deployments/{deployment_id}/statuses/{status_id}"],
+    getEnvironment: ["GET /repos/{owner}/{repo}/environments/{environment_name}"],
     getLatestPagesBuild: ["GET /repos/{owner}/{repo}/pages/builds/latest"],
     getLatestRelease: ["GET /repos/{owner}/{repo}/releases/latest"],
     getPages: ["GET /repos/{owner}/{repo}/pages"],
@@ -14724,6 +14836,7 @@ const Endpoints = {
     getUsersWithAccessToProtectedBranch: ["GET /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users"],
     getViews: ["GET /repos/{owner}/{repo}/traffic/views"],
     getWebhook: ["GET /repos/{owner}/{repo}/hooks/{hook_id}"],
+    getWebhookConfigForRepo: ["GET /repos/{owner}/{repo}/hooks/{hook_id}/config"],
     listBranches: ["GET /repos/{owner}/{repo}/branches"],
     listBranchesForHeadCommit: ["GET /repos/{owner}/{repo}/commits/{commit_sha}/branches-where-head", {
       mediaType: {
@@ -14774,6 +14887,7 @@ const Endpoints = {
     removeUserAccessRestrictions: ["DELETE /repos/{owner}/{repo}/branches/{branch}/protection/restrictions/users", {}, {
       mapToData: "users"
     }],
+    renameBranch: ["POST /repos/{owner}/{repo}/branches/{branch}/rename"],
     replaceAllTopics: ["PUT /repos/{owner}/{repo}/topics", {
       mediaType: {
         previews: ["mercy"]
@@ -14803,8 +14917,12 @@ const Endpoints = {
     updatePullRequestReviewProtection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_pull_request_reviews"],
     updateRelease: ["PATCH /repos/{owner}/{repo}/releases/{release_id}"],
     updateReleaseAsset: ["PATCH /repos/{owner}/{repo}/releases/assets/{asset_id}"],
-    updateStatusCheckPotection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"],
+    updateStatusCheckPotection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks", {}, {
+      renamed: ["repos", "updateStatusCheckProtection"]
+    }],
+    updateStatusCheckProtection: ["PATCH /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"],
     updateWebhook: ["PATCH /repos/{owner}/{repo}/hooks/{hook_id}"],
+    updateWebhookConfigForRepo: ["PATCH /repos/{owner}/{repo}/hooks/{hook_id}/config"],
     uploadReleaseAsset: ["POST /repos/{owner}/{repo}/releases/{release_id}/assets{?name,label}", {
       baseUrl: "https://uploads.github.com"
     }]
@@ -14825,6 +14943,11 @@ const Endpoints = {
       }
     }],
     users: ["GET /search/users"]
+  },
+  secretScanning: {
+    getAlert: ["GET /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}"],
+    listAlertsForRepo: ["GET /repos/{owner}/{repo}/secret-scanning/alerts"],
+    updateAlert: ["PATCH /repos/{owner}/{repo}/secret-scanning/alerts/{alert_number}"]
   },
   teams: {
     addOrUpdateMembershipForUserInOrg: ["PUT /orgs/{org}/teams/{team_slug}/memberships/{username}"],
@@ -14906,7 +15029,7 @@ const Endpoints = {
   }
 };
 
-const VERSION = "4.1.3";
+const VERSION = "4.13.5";
 
 function endpointsToMethods(octokit, endpointsMap) {
   const newMethods = {};
@@ -14988,17 +15111,6 @@ function decorate(octokit, scope, methodName, defaults, decorations) {
 
   return Object.assign(withDecorations, requestWithDefaults);
 }
-
-/**
- * This plugin is a 1:1 copy of internal @octokit/rest plugins. The primary
- * goal is to rebuild @octokit/rest on top of @octokit/core. Once that is
- * done, we will remove the registerEndpoints methods and return the methods
- * directly as with the other plugins. At that point we will also remove the
- * legacy workarounds and deprecations.
- *
- * See the plan at
- * https://github.com/octokit/plugin-rest-endpoint-methods.js/pull/1
- */
 
 function restEndpointMethods(octokit) {
   return endpointsToMethods(octokit, Endpoints);
@@ -15117,22 +15229,24 @@ module.exports = keys;
 /***/ 866:
 /***/ (function(module) {
 
-module.exports = removeHook
+module.exports = removeHook;
 
-function removeHook (state, name, method) {
+function removeHook(state, name, method) {
   if (!state.registry[name]) {
-    return
+    return;
   }
 
   var index = state.registry[name]
-    .map(function (registered) { return registered.orig })
-    .indexOf(method)
+    .map(function (registered) {
+      return registered.orig;
+    })
+    .indexOf(method);
 
   if (index === -1) {
-    return
+    return;
   }
 
-  state.registry[name].splice(index, 1)
+  state.registry[name].splice(index, 1);
 }
 
 
@@ -15194,7 +15308,7 @@ Object.defineProperty(exports, '__esModule', { value: true });
 var request = __webpack_require__(753);
 var universalUserAgent = __webpack_require__(796);
 
-const VERSION = "4.5.4";
+const VERSION = "4.6.1";
 
 class GraphqlError extends Error {
   constructor(request, response) {
@@ -15217,13 +15331,26 @@ class GraphqlError extends Error {
 }
 
 const NON_VARIABLE_OPTIONS = ["method", "baseUrl", "url", "headers", "request", "query", "mediaType"];
+const FORBIDDEN_VARIABLE_OPTIONS = ["query", "method", "url"];
+const GHES_V3_SUFFIX_REGEX = /\/api\/v3\/?$/;
 function graphql(request, query, options) {
-  options = typeof query === "string" ? options = Object.assign({
+  if (options) {
+    if (typeof query === "string" && "query" in options) {
+      return Promise.reject(new Error(`[@octokit/graphql] "query" cannot be used as variable name`));
+    }
+
+    for (const key in options) {
+      if (!FORBIDDEN_VARIABLE_OPTIONS.includes(key)) continue;
+      return Promise.reject(new Error(`[@octokit/graphql] "${key}" cannot be used as variable name`));
+    }
+  }
+
+  const parsedOptions = typeof query === "string" ? Object.assign({
     query
-  }, options) : options = query;
-  const requestOptions = Object.keys(options).reduce((result, key) => {
+  }, options) : query;
+  const requestOptions = Object.keys(parsedOptions).reduce((result, key) => {
     if (NON_VARIABLE_OPTIONS.includes(key)) {
-      result[key] = options[key];
+      result[key] = parsedOptions[key];
       return result;
     }
 
@@ -15231,9 +15358,17 @@ function graphql(request, query, options) {
       result.variables = {};
     }
 
-    result.variables[key] = options[key];
+    result.variables[key] = parsedOptions[key];
     return result;
-  }, {});
+  }, {}); // workaround for GitHub Enterprise baseUrl set with /api/v3 suffix
+  // https://github.com/octokit/auth-app.js/issues/111#issuecomment-657610451
+
+  const baseUrl = parsedOptions.baseUrl || request.endpoint.DEFAULTS.baseUrl;
+
+  if (GHES_V3_SUFFIX_REGEX.test(baseUrl)) {
+    requestOptions.url = baseUrl.replace(GHES_V3_SUFFIX_REGEX, "/api/graphql");
+  }
+
   return request(requestOptions).then(response => {
     if (response.data.errors) {
       const headers = {};
@@ -15515,12 +15650,11 @@ module.exports = toFinite;
 /***/ }),
 
 /***/ 950:
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const url = __webpack_require__(835);
 function getProxyUrl(reqUrl) {
     let usingSsl = reqUrl.protocol === 'https:';
     let proxyUrl;
@@ -15535,7 +15669,7 @@ function getProxyUrl(reqUrl) {
         proxyVar = process.env['http_proxy'] || process.env['HTTP_PROXY'];
     }
     if (proxyVar) {
-        proxyUrl = url.parse(proxyVar);
+        proxyUrl = new URL(proxyVar);
     }
     return proxyUrl;
 }
