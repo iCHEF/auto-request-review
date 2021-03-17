@@ -12858,11 +12858,11 @@ async function fetch_config() {
   let configContent;
 
   if (config_gist_id) {
-    const { data: gistResponse } = await octokit.gists.get({
+    const { data: gist_response } = await octokit.gists.get({
       gist_id: config_gist_id
     });
-    const fileName = Object.keys(gistResponse.files);
-    configContent = data.files[fileName].content;
+    const fileName = Object.keys(gist_response.files);
+    configContent = gist_response.files[fileName].content;
   } else {
     const { data: response_body } = await octokit.repos.getContent({
       owner: context.repo.owner,
