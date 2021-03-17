@@ -9,6 +9,11 @@ inputs:
   config:
     required: false
     default: '.github/auto_request_review.yml'
+    description: 'path of config in repo'
+  config_gist_id:
+    required: false
+    default: null
+    description: 'gist id of config, the priority is higher than the config path'
 runs:
   using: 'node12'
   main: 'dist/index.js'

@@ -35,16 +35,26 @@ async function fetch_config() {
   const context = get_context();
   const octokit = get_octokit();
   const config_path = get_config_path();
+  const config_gist_id = get_config_gist_id();
+  let configContent;
 
-  const { data: response_body } = await octokit.repos.getContent({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    path: config_path,
-    ref: context.ref,
-  });
+  if (config_gist_id) {
+    const { data: gistResponse } = await octokit.gists.get({
+      gist_id: config_gist_id
+    });
+    const fileName = Object.keys(gistResponse.files);
+    configContent = data.files[fileName].content;
+  } else {
+    const { data: response_body } = await octokit.repos.getContent({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      path: config_path,
+      ref: context.ref,
+    });
+    configContent = Buffer.from(response_body.content, response_body.encoding).toString();
+  }
 
-  const content = Buffer.from(response_body.content, response_body.encoding).toString();
-  return yaml.parse(content);
+  return yaml.parse(configContent);
 }
 
 async function fetch_changed_files() {
@@ -105,6 +115,7 @@ async function assign_reviewers(reviewers) {
 let context_cache;
 let token_cache;
 let config_path_cache;
+let config_gist_id_cache;
 let octokit_cache;
 
 function get_context() {
@@ -117,6 +128,10 @@ function get_token() {
 
 function get_config_path() {
   return config_path_cache || (config_path_cache = core.getInput('config'));
+}
+
+function get_config_gist_id() {
+  return config_gist_id_cache || (config_gist_id_cache = core.getInput('config_gist_id'));
 }
 
 function get_octokit() {
